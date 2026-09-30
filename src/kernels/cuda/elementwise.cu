@@ -201,9 +201,20 @@ void silu_inplace(float* x, int64_t n, void* stream) {
 /// the write was not ordered into host-visible memory, so no amount of reading it would show it, and the driver
 /// call was flushing the whole pipeline enough to make it appear.  A 10-22 us driver call per iteration is a
 /// very expensive substitute for one fence instruction.
+// Host-visible doorbell store.  On RDNA4 (gfx12) a plain store to mapped host memory can stay in the GPU's L2
+// until something writes it back, so the CPU spins forever; RDNA3 happened to bypass L2 for it.  A system-scope
+// release store makes the hardware write back the preceding payload and the counter itself.
+__device__ __forceinline__ void doorbell_store(uint32_t* seq, uint32_t v) {
+#if defined(__HIP_PLATFORM_AMD__)
+    __hip_atomic_store(seq, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    *(volatile uint32_t*) seq = v;
+#endif
+}
+
 __global__ void doorbell_ring_kernel(uint32_t* seq) {
     __threadfence_system();
-    *seq = *seq + 1u;
+    doorbell_store(seq, *(volatile uint32_t*) seq + 1u);
 }
 
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
@@ -277,7 +288,7 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence_system();
-        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+        doorbell_store(seq, *(volatile uint32_t*) seq + 1u);
     }
 }
 

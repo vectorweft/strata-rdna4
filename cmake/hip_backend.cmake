@@ -1,11 +1,11 @@
-# Opt-in HIP configuration. Strata's CUDA-shaped kernels currently target RDNA3 gfx1100 wave32.
+# Opt-in HIP configuration. Strata's CUDA-shaped kernels target wave32 RDNA: gfx1100 (RDNA3) and gfx1201 (RDNA4).
 # CMake/compiler discovery stays machine-independent; pass CMAKE_HIP_COMPILER when it is not on PATH.
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
   set(CMAKE_HIP_ARCHITECTURES gfx1100 CACHE STRING "Strata HIP target architecture")
 endif()
-if(NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1100")
+if(NOT CMAKE_HIP_ARCHITECTURES MATCHES "^(gfx1100|gfx1201)$")
   message(FATAL_ERROR
-    "Strata HIP currently supports only gfx1100 wave32; CMAKE_HIP_ARCHITECTURES is '${CMAKE_HIP_ARCHITECTURES}'")
+    "Strata HIP supports gfx1100 or gfx1201 wave32; CMAKE_HIP_ARCHITECTURES is '${CMAKE_HIP_ARCHITECTURES}'")
 endif()
 
 enable_language(HIP)
@@ -33,7 +33,7 @@ set(STRATA_HIP_COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hi
 add_library(strata_hip_runtime INTERFACE)
 target_include_directories(strata_hip_runtime BEFORE INTERFACE
   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1)
+target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 STRATA_HIP_ARCH="${CMAKE_HIP_ARCHITECTURES}")
 target_link_libraries(strata_hip_runtime INTERFACE hip::host)
 foreach(_language IN ITEMS CXX HIP)
   target_compile_options(strata_hip_runtime INTERFACE
