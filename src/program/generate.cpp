@@ -184,6 +184,8 @@ struct Options {
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     bool pin_cpu_experts = false;      ///< ... and page-locked + mapped, so prefill DMAs them straight to the GPU
+    bool split_own_dense = false;      ///< a layer split's cards load only their own layers' dense weights
+    int split_later_reserve_mib = 1024;   ///< extra VRAM a later layer-split stage leaves free beyond --vram-reserve-mib
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -437,6 +439,9 @@ void usage() {
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n"
                  "  --resident-cpu-experts  with mmap and a static profile, keep CPU misses resident in ordinary RAM.\n"
+                 "  --split-later-reserve-mib N  VRAM a later layer-split card leaves free beyond --vram-reserve-mib (1024)\n"
+                 "  --split-own-dense     with an explicit --layer-split K: each card loads only its own layers' dense\n"
+                 "                       weights (the VRAM goes to its expert cache instead)\n"
                  "  --pin-cpu-experts     --resident-cpu-experts, page-locked: the prompt path DMAs those experts\n"
                  "                       straight to the GPU instead of staging each one through a bounce buffer.\n"
                  "                       Borrowed GPU-cache entries may read from mmap during prompt prefill.\n");
@@ -457,6 +462,20 @@ std::vector<std::string> model_shards(const std::string& first) {
         if (std::ifstream(p, std::ios::binary)) out.push_back(p);
     }
     return out.empty() ? std::vector<std::string>{first} : out;
+}
+
+/// The pack's per-layer tensor names outside layers [lb, le) (index.txt rows named blk.<n>.*): what a layer-split
+/// card that runs only [lb, le) need not load.
+std::set<std::string> other_layer_tensors(const std::string& pack, int64_t lb, int64_t le) {
+    std::set<std::string> out;
+    std::ifstream f(pack + "/index.txt");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const std::string name = line.substr(0, line.find(' '));
+        if (!strata::core::NativeDense::in_range(name, lb, le)) out.insert(name);
+    }
+    return out;
 }
 
 /// The shard of a split model that holds `tensor` (shard 1 when none does, so the caller's own error names it).
@@ -1097,6 +1116,8 @@ int main(int argc, char** argv) {
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = true;
         else if (a == "--pin-cpu-experts") o.resident_cpu_experts = o.pin_cpu_experts = true;
+        else if (a == "--split-own-dense") o.split_own_dense = true;
+        else if (a == "--split-later-reserve-mib") o.split_later_reserve_mib = std::atoi(next("--split-later-reserve-mib"));
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
@@ -1416,6 +1437,21 @@ int main(int argc, char** argv) {
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         if (native_pack) skip.insert("token_embd.weight");
     }
+    // --split-own-dense: every card of an explicit layer split loads its own layers' dense weights only
+    const bool own_dense = o.split_own_dense && multi_gpu && !split_auto && !split_at.empty();
+    const int64_t n_layers_all = strata::core::ModelGeometry{}.n_layers;
+    auto stage_range = [&](size_t i) {   // card i (0 = CUDA0): [first layer, end)
+        const int64_t lb = i == 0 ? 0 : split_at[i - 1];
+        const int64_t le = i < split_at.size() ? split_at[i] : n_layers_all;
+        return std::make_pair(lb, le);
+    };
+    const std::set<std::string> skip_all = skip;
+    if (own_dense) {
+        const auto r0 = stage_range(0);
+        for (const auto& n : other_layer_tensors(o.pack, r0.first, r0.second)) skip.insert(n);
+        std::fprintf(stderr, "strata generate: --split-own-dense: CUDA0 loads layers %lld-%lld only\n",
+                     (long long) r0.first, (long long) (r0.second - 1));
+    }
     uint64_t pool_bytes = 0;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -1437,6 +1473,7 @@ int main(int argc, char** argv) {
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), skip.size());
 
     strata::core::NativeDense native_dense;
+    if (own_dense) native_dense.set_layer_range(stage_range(0).first, stage_range(0).second);
     if (!o.native_dense_gguf.empty()) {
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
@@ -1674,9 +1711,22 @@ int main(int argc, char** argv) {
             return 1;
         }
         const strata::core::OnDevice on(st.dev);
+        std::set<std::string> skip_s = skip_all;
+        uint64_t pool_s = pool_bytes;
+        if (own_dense) {
+            const auto r = stage_range(i + 1);
+            for (const auto& n : other_layer_tensors(o.pack, r.first, r.second)) skip_s.insert(n);
+            st.dense.set_layer_range(r.first, r.second);
+            if (!strata::core::WeightTable::pool_bytes(o.pack, pool_s, err, &skip_s)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: --split-own-dense: CUDA%d loads layers %lld-%lld only (%llu MiB)\n",
+                         st.dev, (long long) r.first, (long long) (r.second - 1), (unsigned long long) (pool_s >> 20));
+        }
         void* arena_s = nullptr;
-        if (cudaMalloc(&arena_s, pool_bytes) != cudaSuccess ||
-            !st.wt.load(o.pack, arena_s, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+        if (cudaMalloc(&arena_s, pool_s) != cudaSuccess ||
+            !st.wt.load(o.pack, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d weights: %s\n", st.dev,
                          err.empty() ? "the weight arena does not fit" : err.c_str());
             return 1;
@@ -1874,7 +1924,7 @@ int main(int argc, char** argv) {
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? 1024 : 0)) << 20;
+        const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? o.split_later_reserve_mib : 0)) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     if (multi_gpu && split_auto) {

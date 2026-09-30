@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <cstdlib>
 #include <climits>
 #include <exception>
 #include <limits>
@@ -55,6 +56,12 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 NativeDense::~NativeDense() {
     if (scratch_) cudaFree(scratch_);
     for (void* p : weights_) cudaFree(p);
+}
+
+bool NativeDense::in_range(const std::string& name, int64_t lb, int64_t le) {
+    if (name.compare(0, 4, "blk.") != 0) return true;
+    const int64_t layer = std::atoll(name.c_str() + 4);
+    return layer >= lb && layer < le;
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -128,6 +135,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key)) continue;
+                if (!in_range(tensor.name, lb_, le_)) continue;   // another layer-split stage's layer
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
                 }
