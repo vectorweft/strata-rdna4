@@ -90,6 +90,10 @@ struct WeightRef {
     const void* native_data = nullptr;
     void* native_q8_1 = nullptr;
     int native_type = -1;
+    /// A Q8_0 source matrix (the hyper-connection down/up projections) repacked for the decode kernels, owned by
+    /// NativeDense: [ne1 rows][ne0] int8 quants, then [ne1][ne0 / 32] fp16 block scales.  The canonical `data`
+    /// (bf16) stays for the prompt path.
+    const void* hc_q8 = nullptr;
     /// Plan v0.3 P1: false when the loader SKIPPED this tensor's canonical bytes because another form serves it
     /// (native GGUF projections, the native head).  The metadata above stays valid; `data` is null.
     bool resident = true;

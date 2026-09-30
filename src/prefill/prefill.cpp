@@ -1,4 +1,5 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
@@ -1287,6 +1288,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs);
                 normed = false;
+                // (--native: the down / up matrices are held as Q8_0 only; their bf16 view, dequantized here)
+                core::WeightRef wd_b, wu_b;
+                if (!wd->data && wd->hc_q8) {
+                    wd_b = *wd; wd_b.data = strata::kernels::hc_bf16_from_q8(wd->hc_q8, wd->ne1, wd->ne0, 0, m.cs); wd = &wd_b;
+                }
+                if (!wu->data && wu->hc_q8) {
+                    wu_b = *wu; wu_b.data = strata::kernels::hc_bf16_from_q8(wu->hc_q8, wu->ne1, wu->ne0, 1, m.cs); wu = &wu_b;
+                }
                 if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs);
                 if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;

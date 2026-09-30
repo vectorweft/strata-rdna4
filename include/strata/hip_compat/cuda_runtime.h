@@ -92,6 +92,10 @@ template <typename Kernel>
 inline hipError_t cudaFuncSetAttribute(Kernel kernel, hipFuncAttribute attribute, int value) {
     return hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), attribute, value);
 }
+template <typename Kernel>
+inline hipError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* blocks, Kernel kernel, int threads, size_t lds) {
+    return hipOccupancyMaxActiveBlocksPerMultiprocessor(blocks, reinterpret_cast<const void*>(kernel), threads, lds);
+}
 inline hipError_t cudaGraphInstantiate(hipGraphExec_t* exec, hipGraph_t graph, unsigned long long flags) {
     return hipGraphInstantiateWithFlags(exec, graph, flags);
 }

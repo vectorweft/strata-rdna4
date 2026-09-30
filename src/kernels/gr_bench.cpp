@@ -35,8 +35,27 @@ int main(int argc, char** argv) {
     std::mt19937 rng(5);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<uint16_t> wd((size_t) LR * D), wu((size_t) D * LR), wi((size_t) HC * D);
-    for (auto& v : wd) v = bf16(nd(rng) * 0.01f);
-    for (auto& v : wu) v = bf16(nd(rng) * 0.05f);
+    // down / up as Q8_0 planes ([rows][K] int8, [rows][K/32] fp16) with power-of-two block scales, so the bf16
+    // copies hold exactly the same values and the Q8 kernels can be compared at rounding level
+    auto q8 = [&](std::vector<uint16_t>& bf, int rows, int K, float sigma) {
+        std::vector<uint8_t> planes((size_t) rows * K + (size_t) rows * (K / 32) * 2);
+        std::uniform_int_distribution<int> ed(0, 3);
+        for (int r = 0; r < rows; ++r)
+            for (int b = 0; b < K / 32; ++b) {
+                const int e = 7 + ed(rng);                      // d = 2^-e
+                const float d = std::ldexp(1.0f, -e);
+                const uint16_t h = (uint16_t) ((15 - e) << 10); // fp16 bits of 2^-e
+                std::memcpy(&planes[(size_t) rows * K + ((size_t) r * (K / 32) + b) * 2], &h, 2);
+                for (int j = 0; j < 32; ++j) {
+                    int q = (int) std::lround(nd(rng) * sigma / d);
+                    q = q < -127 ? -127 : q > 127 ? 127 : q;
+                    planes[(size_t) r * K + b * 32 + j] = (uint8_t) (int8_t) q;
+                    bf[(size_t) r * K + b * 32 + j] = bf16(d * (float) q);
+                }
+            }
+        return planes;
+    };
+    const std::vector<uint8_t> qd = q8(wd, LR, D, 0.01f), qu = q8(wu, D, LR, 0.05f);
     for (auto& v : wi) v = bf16(nd(rng) * 0.01f);
     std::vector<float> wn(D), bo(N), ip(HC);
     for (auto& v : wn) v = 1.f + 0.1f * nd(rng);
@@ -44,19 +63,25 @@ int main(int argc, char** argv) {
     for (auto& v : ip) v = nd(rng);
     const uint16_t *d_wd = dev(wd), *d_wu = dev(wu), *d_wi = dev(wi);
     const float *d_wn = dev(wn), *d_bo = dev(bo), *d_ip = dev(ip);
+    const int8_t *d_qd = (const int8_t*) dev(qd), *d_qu = (const int8_t*) dev(qu);
     float* scratch = nullptr;
     cudaMalloc((void**) &scratch, (size_t) k::kFusedGrMaxT * D * sizeof(float) * 4);
     cudaStream_t s;
     cudaStreamCreate(&s);
 
+    k::fused_gr_prepare();
     int failures = 0;
-    for (int T : {1, 2, 4, 6, 8}) {
+    std::vector<int> Ts = {1, 2, 4, 6, 8};
+    if (const char* only = std::getenv("GR_BENCH_T")) Ts = {std::atoi(only)};
+    for (int T : Ts) {
         std::vector<float> R((size_t) T * D);
         for (auto& v : R) v = nd(rng);
         // two independent output sets: variant 0 (reference) and variant 1 (split-K)
-        std::vector<float> out[3][4];
-        double us[3] = {0, 0, 0};
-        for (int var = 0; var < 3; ++var) {
+        std::vector<float> out[6][4];
+        double us[6] = {0, 0, 0, 0, 0, 0};
+        // 2 = split-K 2 (two kernels), 3 = the same on the Q8_0 planes, 4 = Q8_0 in one kernel (grid barrier),
+        // 5 = bf16 in one kernel
+        for (int var = 0; var < 6; ++var) {
             float* d_R = dev(R);
             float *lo, *rs, *inj, *mixed;
             cudaMalloc((void**) &lo, (size_t) T * LR * 4);
@@ -69,8 +94,11 @@ int main(int argc, char** argv) {
                 a[t].bo_prev = d_bo; a[t].inj_prev = d_ip;
                 a[t].w_norm = d_wn; a[t].w_down = d_wd; a[t].w_up = d_wu; a[t].w_inject = d_wi; a[t].eps = 1e-6f;
                 a[t].lo = lo + t * LR; a[t].rs = rs + t * HC; a[t].inject_out = inj + t * HC; a[t].mixed = mixed + t * N;
+                if (var == 3 || var == 4) { a[t].q_down = d_qd; a[t].q_up = d_qu; }
+                a[t].bar_slot = var >= 4 ? 0 : -1;
             }
-            k::fused_gr_read_multi_variant(a, T, scratch, s, var);
+            const int kv = var >= 2 ? 2 : var;
+            k::fused_gr_read_multi_variant(a, T, scratch, s, kv);
             cudaStreamSynchronize(s);
             auto get = [&](float* p, size_t n) { std::vector<float> h(n); cudaMemcpy(h.data(), p, n * 4, cudaMemcpyDeviceToHost); return h; };
             out[var][0] = get(lo, (size_t) T * LR);
@@ -80,7 +108,7 @@ int main(int argc, char** argv) {
             cudaEvent_t e0, e1;
             cudaEventCreate(&e0); cudaEventCreate(&e1);
             cudaEventRecord(e0, s);
-            for (int i = 0; i < iters; ++i) k::fused_gr_read_multi_variant(a, T, scratch, s, var);
+            for (int i = 0; i < iters; ++i) k::fused_gr_read_multi_variant(a, T, scratch, s, kv);
             cudaEventRecord(e1, s);
             cudaEventSynchronize(e1);
             float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
@@ -99,6 +127,7 @@ int main(int argc, char** argv) {
                 a[t].R = d_R + (size_t) t * D; a[t].R_out = d_R + (size_t) t * D;
                 a[t].w_norm = d_wn; a[t].w_down = d_wd; a[t].w_up = d_wu; a[t].w_inject = d_wi;
                 a[t].lo = lo + t * LR; a[t].rs = rs + t * HC; a[t].inject_out = inj + t * HC; a[t].mixed = mixed + t * N;
+                a[t].bar_slot = -1;
             }
             for (int var = 0; var < 3; ++var) {
                 double acc[3] = {0, 0, 0};
@@ -119,7 +148,7 @@ int main(int argc, char** argv) {
         }
         const char* names[4] = {"lo", "inject", "mixed", "rs"};
         double worst = 0;
-        for (int v = 1; v < 3; ++v)
+        for (int v = 1; v < 6; ++v)
         for (int o = 0; o < 4; ++o) {
             double n = 0, d = 0;
             for (size_t i = 0; i < out[0][o].size(); ++i) { n += std::fabs(out[v][o][i] - out[0][o][i]); d += std::fabs(out[0][o][i]); }
@@ -127,8 +156,50 @@ int main(int argc, char** argv) {
             if (r > worst) worst = r;
             if (r > 1e-5) { std::printf("  T=%d var %d %s rel %.2e MISMATCH\n", T, v, names[o], r); ++failures; }
         }
-        std::printf("T=%d  reference %.1f us  split-K %.1f us  split-K 2 %.1f us  (13.1 MB of weights -> %.0f / %.0f / %.0f GB/s)  worst rel %.1e\n",
-                    T, us[0], us[1], us[2], 13100.0 / us[0], 13100.0 / us[1], 13100.0 / us[2], worst);
+        if (unsigned to = k::fused_gr_barrier_timeouts()) std::printf("  T=%d: fused barrier timeouts %u\n", T, to);
+        std::printf("T=%d  reference %.1f  split-K %.1f  split-K 2 %.1f  Q8 %.1f  Q8 fused %.1f  bf16 fused %.1f us  worst rel %.1e\n",
+                    T, us[0], us[1], us[2], us[3], us[4], us[5], worst);
+    }
+    {   // the decode window's case: every call reads weights the last-level cache (R9700: 64 MB) no longer holds
+        constexpr int NL = 24;
+        std::vector<const uint16_t*> cwd(NL), cwu(NL);
+        std::vector<const int8_t*> cqd(NL), cqu(NL);
+        for (int l = 0; l < NL; ++l) { cwd[l] = dev(wd); cwu[l] = dev(wu); cqd[l] = (const int8_t*) dev(qd); cqu[l] = (const int8_t*) dev(qu); }
+        for (int T : {1, 2, 4, 6}) {
+            std::vector<float> R((size_t) T * D);
+            for (auto& v : R) v = nd(rng);
+            float* d_R = dev(R);
+            float *lo, *rs, *inj, *mixed;
+            cudaMalloc((void**) &lo, (size_t) T * LR * 4); cudaMalloc((void**) &rs, (size_t) T * HC * 4);
+            cudaMalloc((void**) &inj, (size_t) T * HC * 4); cudaMalloc((void**) &mixed, (size_t) T * N * 4);
+            double us[4];
+            for (int q = 0; q < 4; ++q) {   // bf16 two kernels, Q8 two kernels, Q8 fused, bf16 fused
+                cudaEvent_t e0, e1;
+                cudaEventCreate(&e0); cudaEventCreate(&e1);
+                const int reps = 20;
+                for (int i = -1; i < reps; ++i) {
+                    if (i == 0) cudaEventRecord(e0, s);
+                    for (int l = 0; l < NL; ++l) {
+                        k::FusedGrArgs a[k::kFusedGrMaxT];
+                        for (int t = 0; t < T; ++t) {
+                            a[t].R = d_R + (size_t) t * D; a[t].R_out = d_R + (size_t) t * D;
+                            a[t].w_norm = d_wn; a[t].w_down = cwd[l]; a[t].w_up = cwu[l]; a[t].w_inject = d_wi;
+                            if (q == 1 || q == 2) { a[t].q_down = cqd[l]; a[t].q_up = cqu[l]; }
+                            a[t].bar_slot = q >= 2 ? 0 : -1;
+                            a[t].lo = lo + t * LR; a[t].rs = rs + t * HC; a[t].inject_out = inj + t * HC; a[t].mixed = mixed + t * N;
+                        }
+                        k::fused_gr_read_multi_variant(a, T, scratch, s, 2);
+                    }
+                }
+                cudaEventRecord(e1, s);
+                cudaEventSynchronize(e1);
+                float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+                us[q] = 1000.0 * ms / (reps * NL);
+            }
+            std::printf("cold T=%d  bf16 %.1f us (%.0f GB/s)  Q8 %.1f us (%.0f GB/s)  Q8 fused %.1f us (%.0f GB/s)  bf16 fused %.1f us\n",
+                        T, us[0], 13100.0 / us[0], us[1], 6600.0 / us[1], us[2], 6600.0 / us[2], us[3]);
+            cudaFree(d_R); cudaFree(lo); cudaFree(rs); cudaFree(inj); cudaFree(mixed);
+        }
     }
     return failures ? 1 : 0;
 }

@@ -31,6 +31,13 @@ struct FusedGrArgs {
     const uint16_t* w_down = nullptr;  ///< bf16 [hc_lr][hc*n_embd]
     const uint16_t* w_up = nullptr;    ///< bf16 [hc*n_embd][hc_lr]
     const uint16_t* w_inject = nullptr;///< bf16 [hc][hc*n_embd], or null (the final mixer)
+    /// The Q8_0 source of w_down / w_up (core::WeightRef::hc_q8: [rows][K] int8 then [rows][K / 32] fp16 scales),
+    /// read instead of the bf16 copies by the split-K variant when both are given; half the bytes.
+    const int8_t* q_down = nullptr;
+    const int8_t* q_up = nullptr;
+    /// Variant 2 runs down and up as ONE kernel with a grid barrier when the device holds all its blocks at once;
+    /// the barrier's counter slot (0-3) must differ between streams that may run this concurrently.  -1: never.
+    int bar_slot = 0;
     float eps = 1e-6f;
     float* lo = nullptr;               ///< workspace, hc_lr floats
     float* rs = nullptr;               ///< workspace, hc floats
@@ -49,6 +56,19 @@ constexpr int kFusedGrMaxT = 8;
 /// Floats `xn_scratch` must hold beyond n_tok * hc * n_embd: the split-K down projection's partial sums
 /// (8 K-splits x 8 tokens x (hc_lr + hc) rows) and each split's sum of squares per token.
 constexpr int kFusedGrScratchExtra = 8 * kFusedGrMaxT * (320 + 4) + 8 * kFusedGrMaxT;
+/// Measures, on the current device, whether the one-kernel read (variant 2 with a grid barrier) has all its blocks
+/// resident at once for each token count; until this has run on a device the two-kernel path is used there.  Call
+/// outside stream capture (it synchronizes the device).
+void fused_gr_prepare();
+/// A bf16 [rows][K] view of a hyper-connection matrix held only as Q8_0 planes (core::WeightRef::hc_q8), for the
+/// kernels that read bf16: dequantized on `stream` into this device's scratch `slot` (0 or 1; valid until the next
+/// call with that slot on the device), bitwise the values the pack's bf16 copy holds.  hc_bf16_reserve() first,
+/// outside stream capture.
+bool hc_bf16_reserve();
+const uint16_t* hc_bf16_from_q8(const void* planes, int64_t rows, int64_t K, int slot, void* stream);
+/// Grid barriers of the one-kernel read that timed out on the current device (1000 each + the blocks that had
+/// arrived); 0 unless something is wrong.
+unsigned fused_gr_barrier_timeouts();
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 /// The same with the implementation chosen: 0 = the reference kernels (one warp per down row over all of K; every

@@ -2,11 +2,13 @@
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/fused_gr.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdlib>
 #include <climits>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -26,6 +28,21 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+// The hyper-connection projections: bf16 in the canonical pack (the prompt path's GEMMs), Q8_0 in the GGUF.  The
+// decode window reads the Q8_0 bytes instead - half the traffic, and the source values exactly.
+bool hc_q8_eligible(const strata::TensorInfo& tensor) {
+    const auto& name = tensor.name;
+    if (name.rfind("blk.", 0) != 0 || tensor.type != 8 || tensor.shape.size() != 2 || tensor.shape[0] % 32 != 0)
+        return false;
+    static const char* suffixes[] = {".hc_attn_down.weight", ".hc_attn_up.weight", ".hc_ffn_down.weight",
+                                     ".hc_ffn_up.weight"};
+    for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
+    return false;
+}
+bool hc_q8_enabled() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_Q8"); return !(v && v[0] == '0'); }();
+    return on;
+}
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
@@ -42,8 +59,8 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
-                    tensor.shape.size() == 2)
+                if ((eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
+                     tensor.shape.size() == 2) || (hc_q8_enabled() && hc_q8_eligible(tensor)))
                     out.insert(tensor.name);
         }
         return true;
@@ -167,6 +184,43 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
+        // the hyper-connection Q8_0 planes: [rows][K] int8, then [rows][K / 32] fp16 scales (16-byte aligned rows)
+        std::vector<std::pair<WeightRef*, void*>> hc_pending;
+        for (const auto& path : shards) {
+            if (!hc_q8_enabled()) break;
+            strata::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!hc_q8_eligible(tensor) || !in_range(tensor.name, lb_, le_)) continue;
+                auto found = table.table_.find(tensor.name);
+                if (found == table.table_.end()) continue;
+                auto& ref = found->second;
+                const uint64_t K = tensor.shape[0], rows = tensor.shape[1], nb = K / 32;
+                if (ref.hc_q8 || (int64_t) K != ref.ne0 || (int64_t) rows != ref.ne1 || rows * K > 10240ull * 320ull) {
+                    err = "native dense: incompatible hyper-connection matrix " + tensor.name; return false;
+                }
+                std::vector<uint8_t> host(rows * K + rows * nb * 2);
+                const uint8_t* src = gguf.tensor_data(tensor);
+                int8_t* qs = (int8_t*) host.data();
+                uint8_t* ds = host.data() + rows * K;
+                for (uint64_t r = 0; r < rows; ++r)
+                    for (uint64_t b = 0; b < nb; ++b) {
+                        const uint8_t* blk = src + (r * nb + b) * 34;
+                        std::memcpy(ds + (r * nb + b) * 2, blk, 2);
+                        std::memcpy(qs + r * K + b * 32, blk + 2, 32);
+                    }
+                void* allocation = nullptr;
+                auto status = cudaMalloc(&allocation, host.size());
+                if (status == cudaSuccess)
+                    status = cudaMemcpy(allocation, host.data(), host.size(), cudaMemcpyHostToDevice);
+                if (status != cudaSuccess) {
+                    if (allocation) cudaFree(allocation);
+                    for (auto& h : hc_pending) cudaFree(h.second);
+                    err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
+                }
+                total += host.size();
+                hc_pending.emplace_back(&ref, allocation);
+            }
+        }
         void* allocation = nullptr;
         const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
@@ -178,6 +232,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();
             weights_.push_back(item.data.release());
+        }
+        for (auto& h : hc_pending) {
+            h.first->hc_q8 = h.second;
+            weights_.push_back(h.second);
+        }
+        if (!hc_pending.empty() && !strata::kernels::hc_bf16_reserve()) {
+            err = "native dense: the hyper-connection bf16 scratch"; return false;
         }
         scratch_ = scratch.release();
         bytes_ = total;
