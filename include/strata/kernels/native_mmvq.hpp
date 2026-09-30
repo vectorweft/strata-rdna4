@@ -106,6 +106,13 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 // capability query returns false.
 bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
+/// The GDN front of a verify window in one launch: y_qkv = W_qkv . x and y_z = W_z . x (Q8_0 against the q8_1
+/// activation x_q8_1, each exactly native_mmvq's value) and the alpha / beta rows (exactly gdn_ab_multi's, from the
+/// f32 activation x).  gdn_front_supported: both Q8_0 and not STRATA_GDN_FRONT=0.
+bool gdn_front_supported(int qkv_type, int z_type, int n_in);
+void gdn_front(const void* w_qkv, const void* w_z, const void* x_q8_1, float* y_qkv, float* y_z, int n_in, int n_qkv,
+               int n_z, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt,
+               const float* ssm_a, float* gate, float* beta, int h_v, int ncols, void* stream);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 

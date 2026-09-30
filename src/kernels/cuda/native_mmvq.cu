@@ -25,11 +25,13 @@
 
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/gdn_ab_row.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -996,13 +998,11 @@ struct SmallTraits {
 bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
 
 template<typename F, int NCOLS, int NW, int ROWS>
-__launch_bounds__(NW * WARP, 1)
-__global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
-                                         const Q81Block* __restrict__ x,
-                                         float* __restrict__ y, int n_in, int n_out) {
+__device__ __forceinline__ void mmvq_multi_rows(const typename F::Block* __restrict__ w,
+                                                const Q81Block* __restrict__ x,
+                                                float* __restrict__ y, int n_in, int n_out, int row0) {
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
-    const int row0 = ROWS * int(blockIdx.x);
     const int blocks_per_row = n_in / F::DIV;
     const int x_stride = n_in / Q8K;                   // Q8_1 blocks per activation column
     float tmp[NCOLS][ROWS] = {};
@@ -1039,6 +1039,14 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
             if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
         }
     }
+}
+
+template<typename F, int NCOLS, int NW, int ROWS>
+__launch_bounds__(NW * WARP, 1)
+__global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
+                                         const Q81Block* __restrict__ x,
+                                         float* __restrict__ y, int n_in, int n_out) {
+    mmvq_multi_rows<F, NCOLS, NW, ROWS>(w, x, y, n_in, n_out, ROWS * int(blockIdx.x));
 }
 
 template<typename F, int NCOLS>
@@ -1487,6 +1495,64 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
+}
+
+namespace {
+// The GDN front of a verify window in ONE launch: blocks [0, n_qkv) the qkv rows, [n_qkv, n_qkv + n_z) the z rows
+// (both Q8_0 against the same q8_1 activation, each row exactly as native_mmvq computes it - one block per row,
+// the ncols = 1 thread mapping), then 4 alpha / beta rows per block exactly as gdn_ab_multi computes them.  Two
+// launch boundaries fewer per GDN layer, and one grid for 44.6 MB instead of 27.9 + 16.7 + 0.5.
+using Q80T = SmallTraits<Q80Block, 8>;
+template<int NCOLS>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void gdn_front_kernel(const Q80Block* __restrict__ w_qkv, const Q80Block* __restrict__ w_z,
+                                 const Q81Block* __restrict__ xq, float* __restrict__ y_qkv, float* __restrict__ y_z,
+                                 int n_in, int n_qkv, int n_z, const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                 const uint16_t* __restrict__ wb, const float* __restrict__ dt,
+                                 const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta,
+                                 int h_v) {
+    const int b = int(blockIdx.x);
+    if (b < n_qkv) {
+        mmvq_multi_rows<Q80T, NCOLS, WARPS, 1>(w_qkv, xq, y_qkv, n_in, n_qkv, b);
+    } else if (b < n_qkv + n_z) {
+        mmvq_multi_rows<Q80T, NCOLS, WARPS, 1>(w_z, xq, y_z, n_in, n_z, b - n_qkv);
+    } else {
+        gdn_ab_row(x, wa, wb, dt, ssm_a, gate, beta, n_in, h_v, NCOLS, (b - n_qkv - n_z) * WARPS + int(threadIdx.y),
+                   int(threadIdx.x));
+    }
+}
+}  // namespace
+
+bool gdn_front_supported(int qkv_type, int z_type, int n_in) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_GDN_FRONT"); return !(v && v[0] == '0'); }();
+    return on && qkv_type == 8 && z_type == 8 && n_in % 32 == 0 && n_in / 32 >= Q80T::BPI;
+}
+
+void gdn_front(const void* w_qkv, const void* w_z, const void* x_q8_1, float* y_qkv, float* y_z, int n_in, int n_qkv,
+               int n_z, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt,
+               const float* ssm_a, float* gate, float* beta, int h_v, int ncols, void* stream) {
+    validate_shape(n_in, ncols, 32);
+    validate_stream(stream);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const unsigned blocks = unsigned(n_qkv + n_z + (2 * h_v + WARPS - 1) / WARPS);
+    const dim3 threads(WARP, WARPS);
+    const auto* wq = static_cast<const Q80Block*>(w_qkv);
+    const auto* wz = static_cast<const Q80Block*>(w_z);
+    const auto* xq = static_cast<const Q81Block*>(x_q8_1);
+#define STRATA_GDN_FRONT(NC) gdn_front_kernel<NC><<<blocks, threads, 0, s>>>(wq, wz, xq, y_qkv, y_z, n_in, n_qkv, n_z, \
+                                                                             x, w_alpha, w_beta, dt, ssm_a, gate, beta, h_v)
+    switch (ncols) {
+        case 1: STRATA_GDN_FRONT(1); break;
+        case 2: STRATA_GDN_FRONT(2); break;
+        case 3: STRATA_GDN_FRONT(3); break;
+        case 4: STRATA_GDN_FRONT(4); break;
+        case 5: STRATA_GDN_FRONT(5); break;
+        case 6: STRATA_GDN_FRONT(6); break;
+        case 7: STRATA_GDN_FRONT(7); break;
+        case 8: STRATA_GDN_FRONT(8); break;
+    }
+#undef STRATA_GDN_FRONT
+    launch_check();
 }
 
 } // namespace strata::kernels

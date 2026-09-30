@@ -503,16 +503,29 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
-                stamp(l, 2, grp);
-                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
-                stamp(l, 3, grp);
-                gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                             (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
-                             n, cs);
-                stamp(l, 4, grp);
-                native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
-                stamp(l, 5, grp);
+                if (gdn_front_supported(wqkv->native_type, wg->native_type, (int) N)) {
+                    // qkv, z and alpha / beta in one launch (profile: all of it on "q8+qkv", conv on "conv")
+                    gdn_front(wqkv->native_data, wg->native_data, xq_, qkv + (size_t) tb * C, z_ + (size_t) tb * ZV,
+                              (int) N, (int) C, (int) ZV, xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data,
+                              (const float*) wdt->data, (const float*) wsa->data, gate + (size_t) tb * HV,
+                              beta + (size_t) tb * HV, (int) HV, n, cs);
+                    stamp(l, 2, grp);
+                    gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
+                    stamp(l, 3, grp);
+                    stamp(l, 4, grp);
+                    stamp(l, 5, grp);
+                } else {
+                    native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
+                    stamp(l, 2, grp);
+                    gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
+                    stamp(l, 3, grp);
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
+                                 n, cs);
+                    stamp(l, 4, grp);
+                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+                    stamp(l, 5, grp);
+                }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, nullptr, cs, tb);
