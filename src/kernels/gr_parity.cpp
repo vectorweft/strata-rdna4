@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <random>
 #include <string>
@@ -290,7 +291,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     check(cudaMalloc(&d_rs, (size_t) T * HC * sizeof(float)), "multi rs");
     check(cudaMalloc(&d_inj_out, (size_t) T * HC * sizeof(float)), "multi injection");
     check(cudaMalloc(&d_mixed, (size_t) T * N * sizeof(float)), "multi mixed");
-    check(cudaMalloc(&d_xn, (size_t) T * D * sizeof(float)), "multi xn");
+    check(cudaMalloc(&d_xn, ((size_t) T * D + kFusedGrScratchExtra) * sizeof(float)), "multi xn");
     check(cudaMemcpy(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice), "multi copy R");
     check(cudaMemcpy(d_bo, bo.data(), bo.size() * sizeof(float), cudaMemcpyHostToDevice), "multi copy bo");
     check(cudaMemcpy(d_inj, inj.data(), inj.size() * sizeof(float), cudaMemcpyHostToDevice), "multi copy inj");
@@ -339,6 +340,21 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                std::memcmp(a.mixed.data(), b.mixed.data(), a.mixed.size() * sizeof(float)) == 0;
     };
 
+    // the split-K multi kernels (the default; STRATA_GR_SPLITK=0 selects the reference ones) sum in another order:
+    // against the single-token path they are compared to rounding, against themselves (graph replay) bitwise
+    const bool split_k = !(std::getenv("STRATA_GR_SPLITK") && std::getenv("STRATA_GR_SPLITK")[0] == '0');
+    auto close_rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double n = 0, d = 0;
+        for (size_t i = 0; i < a.size(); ++i) { n += std::fabs((double) a[i] - b[i]); d += std::fabs((double) b[i]); }
+        return n / (d + 1e-30);
+    };
+    auto matches_single = [&](const Snapshot& a, const Snapshot& b) {
+        if (!split_k) return same(a, b);
+        const double w = std::max({close_rel(a.r_out, b.r_out), close_rel(a.lo, b.lo), close_rel(a.rs, b.rs),
+                                   close_rel(a.inject, b.inject), close_rel(a.mixed, b.mixed)});
+        if (w > 1e-5) std::printf("  split-K vs single-token: worst rel %.2e\n", w);
+        return w <= 1e-5;
+    };
     cudaStream_t stream = nullptr;
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "multi stream");
     // Max T forces the HIP kernel's full dynamic-LDS request: 8 * 1280 * sizeof(float) = 40 KiB.
@@ -349,7 +365,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     check(cudaStreamSynchronize(stream), "single reference sync");
     const Snapshot single = snapshot();
     int bad = 0;
-    if (!same(multi, single)) {
+    if (!matches_single(multi, single)) {
         std::printf("  fused GR multi max-T differs from single-token calls\n");
         ++bad;
     }
@@ -384,7 +400,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     }
     for (int t = 0; t < T; ++t) fused_gr_read(args[t], stream);
     check(cudaStreamSynchronize(stream), "changed single reference sync");
-    if (!same(replay, snapshot())) {
+    if (!matches_single(replay, snapshot())) {
         std::printf("  fused GR changed graph replay differs from single-token calls\n");
         ++bad;
     }

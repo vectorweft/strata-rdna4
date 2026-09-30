@@ -46,7 +46,17 @@ void fused_gr_read(const FusedGrArgs& a, void* stream);
 /// weight pointers and eps must be the same for every t); `xn_scratch` is n_tok * hc * n_embd floats.  Every
 /// token's outputs are bitwise `fused_gr_read(a[t])`.
 constexpr int kFusedGrMaxT = 8;
+/// Floats `xn_scratch` must hold beyond n_tok * hc * n_embd: the split-K down projection's partial sums
+/// (8 K-splits x 8 tokens x (hc_lr + hc) rows) and each split's sum of squares per token.
+constexpr int kFusedGrScratchExtra = 8 * kFusedGrMaxT * (320 + 4) + 8 * kFusedGrMaxT;
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+/// The same with the implementation chosen: 0 = the reference kernels (one warp per down row over all of K; every
+/// token bitwise fused_gr_read), 1 = split-K without the norm kernel: the down projection over 168 blocks instead of
+/// 41 reads R' * w_norm itself, and the per-stream RMS scale is applied when the up kernel reduces the partials (the
+/// projection is linear and a K slice lies in one stream); outputs equal to rounding (1e-7).  fused_gr_read_multi uses 1 unless
+/// STRATA_GR_SPLITK=0.
+void fused_gr_read_multi_variant(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, int variant,
+                                 unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 
 }  // namespace strata::kernels

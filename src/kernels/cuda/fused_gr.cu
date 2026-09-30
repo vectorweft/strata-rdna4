@@ -241,18 +241,143 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
     }
 }
 
+// Split-K down projection (R9700 / RDNA4: 32 WGPs, 41 blocks of the kernel above leave most of them idle and each
+// lane with 5 loads in flight).  Block (g, s) computes 16 rows (2 per warp) over K slice s of 1280: the 10 weight
+// chunks per lane are issued before the activation tile is staged, the T x 1280 tile is shared by the 16 rows, and
+// each (split, token, row) partial is written to `part`; the up kernel sums the 8 splits in a fixed order.
+constexpr int SK_KC = 1280;
+constexpr int SK_S = D / SK_KC;                    // 8
+constexpr int SK_ROWS = 16;
+constexpr int SK_RPW = SK_ROWS / WARPS;            // 2 rows per warp
+constexpr int SK_ALL = LR + HC;                    // 320 down rows, then the 4 inject rows
+constexpr int SK_GROUPS = (SK_ALL + SK_ROWS - 1) / SK_ROWS;   // 21
+constexpr int SK_Q = SK_KC / 8 / 32;               // 5 uint4 chunks per lane per row
+static_assert(SK_S * kFusedGrMaxT * SK_ALL + SK_S * kFusedGrMaxT == kFusedGrScratchExtra, "scratch layout");
+static_assert(N % SK_KC == 0, "a K slice lies in one stream");
+
+__global__ void __launch_bounds__(THREADS) gr_down_splitk_kernel(GrMulti m, float* __restrict__ part,
+                                                                   float* __restrict__ part_ss) {
+    extern __shared__ __align__(16) float tile[];   // [T][SK_KC]
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = m.T, g = blockIdx.x, s = blockIdx.y, base = s * SK_KC;
+    const bool has_inject = m.a[0].w_inject != nullptr;
+    uint4 wv[SK_RPW][SK_Q];
+    int rows[SK_RPW];
+    bool live[SK_RPW];
+#pragma unroll
+    for (int rr = 0; rr < SK_RPW; ++rr) {
+        const int r = g * SK_ROWS + warp * SK_RPW + rr;
+        rows[rr] = r;
+        live[rr] = r < LR || (r < SK_ALL && has_inject);
+        const uint16_t* wrow = live[rr] ? (r < LR ? m.a[0].w_down + (size_t) r * D : m.a[0].w_inject + (size_t) (r - LR) * D)
+                                        : m.a[0].w_down;
+        const uint4* w4 = reinterpret_cast<const uint4*>(wrow) + base / 8;
+#pragma unroll
+        for (int q = 0; q < SK_Q; ++q) wv[rr][q] = live[rr] ? __ldg(w4 + lane + 32 * q) : make_uint4(0, 0, 0, 0);
+    }
+    // the tile: R' * w_norm for this slice of every token (R' = R + the pending write), and in the first row group
+    // each token's sum of squares of R' over the slice (the RMS of stream base / N comes from two slices)
+    __shared__ float ss_part[WARPS][kFusedGrMaxT];
+    const int c = base / N, d0 = base - c * N;
+    float4* tile4 = reinterpret_cast<float4*>(tile);
+    float ssq[kFusedGrMaxT];
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) ssq[k] = 0.0f;
+    for (int i = t; i < T * (SK_KC / 4); i += THREADS) {
+        const int k = i / (SK_KC / 4), off = i - k * (SK_KC / 4);
+        const FusedGrArgs& a = m.a[k];
+        float4 r = reinterpret_cast<const float4*>(a.R + base)[off];
+        if (a.apply) {
+            const float gw = 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC);
+            const float4 b = reinterpret_cast<const float4*>(a.bo_prev + d0)[off];
+            r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
+        }
+        const float4 g = reinterpret_cast<const float4*>(a.w_norm + base)[off];
+        const float sq = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+#pragma unroll
+        for (int kk = 0; kk < kFusedGrMaxT; ++kk) if (kk == k) ssq[kk] += sq;
+        tile4[i] = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
+    }
+    if (g == 0) {
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            const float v = warp_sum(ssq[k]);
+            if (lane == 0) ss_part[warp][k] = v;
+        }
+    }
+    __syncthreads();
+    if (g == 0 && t < T) {
+        float v = 0.0f;
+        for (int w = 0; w < WARPS; ++w) v += ss_part[w][t];
+        part_ss[s * kFusedGrMaxT + t] = v;
+    }
+#pragma unroll
+    for (int rr = 0; rr < SK_RPW; ++rr) {
+        if (!live[rr]) continue;
+        float acc[kFusedGrMaxT];
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int q = 0; q < SK_Q; ++q) {
+            const int j = lane + 32 * q;
+#pragma unroll
+            for (int k = 0; k < kFusedGrMaxT; ++k)
+                if (k < T) acc[k] += dot8(wv[rr][q], tile + k * SK_KC + j * 8);
+        }
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            const float v = warp_sum(acc[k]);
+            if (lane == k) part[((size_t) s * kFusedGrMaxT + k) * SK_ALL + rows[rr]] = v;
+        }
+    }
+}
+
 constexpr int UPM_COLS = 16;                      // columns per block (x 4 streams = 64 rows, 8 per warp)
 constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
 
 // `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
 // sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
-__global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
+__global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m, const float* __restrict__ part,
+                                                              const float* __restrict__ part_ss) {
     __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
     __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
+    __shared__ float s_rs[kFusedGrMaxT][HC];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = m.T;
     const int d0 = blockIdx.x * UPM_COLS;
-    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    if (part == nullptr) {
+        for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    } else {
+        // split-K: each stream's RMS scale from its two slices' sums of squares
+        if (t < T * HC) {
+            const int k = t / HC, c = t - k * HC;
+            const int per = N / SK_KC;
+            float ss = 0.0f;
+            for (int j = 0; j < per; ++j) ss += part_ss[(c * per + j) * kFusedGrMaxT + k];
+            const float v = rsqrtf(ss / (float) N + m.a[k].eps);
+            s_rs[k][c] = v;
+            if (blockIdx.x == 0) m.a[k].rs[c] = v;
+        }
+        __syncthreads();
+        // the 8 partials of each row scaled by their stream's rs, in split order; then silu of the mean
+        for (int i = t; i < T * SK_ALL; i += THREADS) {
+            const int k = i / SK_ALL, r = i - k * SK_ALL;
+            float sum = 0.0f;
+#pragma unroll
+            for (int sp = 0; sp < SK_S; ++sp)
+                sum += s_rs[k][sp * SK_KC / N] * part[((size_t) sp * kFusedGrMaxT + k) * SK_ALL + r];
+            if (r < LR) {
+                const float x = sum / (float) HC;
+                const float v = x / (1.0f + __expf(-x));
+                lo[k][r] = v;
+                if (blockIdx.x == 0) m.a[k].lo[r] = v;
+            } else if (blockIdx.x == 0 && m.a[0].w_inject != nullptr) {
+                m.a[k].inject_out[r - LR] = sum;
+            }
+        }
+    }
     __syncthreads();
     for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
@@ -266,7 +391,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
             const FusedGrArgs& a = m.a[lane];
             rv = a.R[i];
             wn = a.w_norm[i];
-            rsc = a.rs[c];
+            rsc = part ? s_rs[lane][c] : a.rs[c];
             apply = a.apply;
             if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
         }
@@ -302,6 +427,12 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
 
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
+    static const int variant = [] { const char* v = std::getenv("STRATA_GR_SPLITK"); return v && v[0] == '0' ? 0 : 1; }();
+    fused_gr_read_multi_variant(a, n_tok, xn_scratch, stream, variant, stamp_buf, stamp_i0);
+}
+
+void fused_gr_read_multi_variant(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, int variant,
+                                 unsigned long long* stamp_buf, int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
@@ -320,6 +451,29 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
+        if (variant == 1) {
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);   // (no norm kernel: the split keeps the stamp layout)
+        float* part = xn_scratch + (size_t) n_tok * D;   // kFusedGrScratchExtra floats past the tokens' xn
+        float* part_ss = part + (size_t) SK_S * kFusedGrMaxT * SK_ALL;
+        static bool sk_attr[64] = {};
+        int sdev = 0;
+        cudaGetDevice(&sdev);
+        if (sdev >= 0 && sdev < 64 && !sk_attr[sdev]) {
+            cudaFuncSetAttribute(gr_down_splitk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int) (kFusedGrMaxT * SK_KC * sizeof(float)));
+            cudaGetLastError();
+            sk_attr[sdev] = true;
+        }
+        gr_down_splitk_kernel<<<dim3(SK_GROUPS, SK_S), THREADS, (size_t) n_tok * SK_KC * sizeof(float), st>>>(m, part, part_ss);
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+        gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, part_ss);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "fused_gr_read_multi (split-K): %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+        return;
+    }
     gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
     // the shared-memory opt-in is a per-DEVICE setting: once per device, not once per process (a layer split
@@ -360,7 +514,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
-    gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m, nullptr, nullptr);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));

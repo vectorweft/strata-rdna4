@@ -4956,6 +4956,10 @@ int main(int argc, char** argv) {
                         ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
+        if (rounds > 0) {   // STRATA_VERIFY_PROFILE: the windows' GPU stage stamps
+            const std::string pr = ver.profile_report();
+            if (!pr.empty()) std::printf("%-24s%s\n", "verify GPU stages", pr.c_str());
+        }
         if (rounds > 0)
             std::printf("%-24s gate/up %.3f  quantize %.3f  down %.3f ms/round; %.1f GB/s over the rows phases; "
                         "CPU pool call %.3f ms/round\n", "pool multi", pool.ms_multi_gu / rounds,
