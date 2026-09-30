@@ -252,6 +252,7 @@ struct Prefill::Impl {
     core::ExpertSource* src = nullptr;
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
+    std::vector<std::pair<int, const core::ExpertCache*>> helpers;   // (device, cache) of the helper GPUs
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
     cudaStream_t cs = nullptr, copy = nullptr;
@@ -458,6 +459,23 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     }
     return a.used;
 }
+}
+
+void Prefill::set_helper_caches(const std::vector<std::pair<int, const core::ExpertCache*>>& helpers) {
+    Impl& m = *impl_;
+    m.helpers = helpers;
+    int self = 0;
+    cudaGetDevice(&self);
+    for (const auto& h : helpers) {   // peer access both ways; "already enabled" is fine
+        int can = 0;
+        if (cudaDeviceCanAccessPeer(&can, self, h.first) == cudaSuccess && can) {
+            cudaDeviceEnablePeerAccess(h.first, 0);
+            cudaSetDevice(h.first);
+            cudaDeviceEnablePeerAccess(self, 0);
+            cudaSetDevice(self);
+        }
+        (void) cudaGetLastError();
+    }
 }
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
@@ -1075,7 +1093,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= STREAM_ALL_MIN && m.src != nullptr;
-        struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
+        struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* peer = nullptr; int peer_dev = -1; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
@@ -1086,6 +1104,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 seq_start[(size_t) l] = seq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    bool on_helper = false;   // a helper GPU holds it: peer DMA from its slot, no host copy
+                    for (const auto& h : m.helpers) {
+                        const int32_t hs = h.second->slot_of(l, e);
+                        if (hs < 0) continue;
+                        seq.push_back({(int32_t) l, e, nullptr, -1, h.second->device_slot(hs), h.first});
+                        on_helper = true;
+                        break;
+                    }
+                    if (on_helper) continue;
                     const uint8_t* b = m.src->blob(l, e);
                     if (!b) { err = "prefill: expert source has no blob"; return false; }
                     int job = -1;
@@ -1111,7 +1138,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 const auto th = Clock::now();
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
-                if (en.job < 0) {
+                if (en.peer) {
+                    cudaMemcpyPeerAsync(m.stage_dev[sl], m.device >= 0 ? m.device : 0, en.peer, en.peer_dev, bytes, m.copy);
+                    ++stats_.experts_peer;
+                } else if (en.job < 0) {
                     cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                     ++stats_.experts_dma;
                 } else {
@@ -1137,7 +1167,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::atomic<size_t> a_issued{0}, a_consumed{0};
         std::atomic<bool> a_stop{false};
         double iss_ms = 0;
-        int64_t iss_streamed = 0, iss_dma = 0;
+        int64_t iss_streamed = 0, iss_dma = 0, iss_peer = 0;
         std::thread issuer;
         struct IssuerJoin {
             std::atomic<bool>* stop;
@@ -1158,7 +1188,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                     if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
-                    if (en.job < 0) {
+                    if (en.peer) {
+                        cudaMemcpyPeerAsync(m.stage_dev[sl], m.device >= 0 ? m.device : 0, en.peer, en.peer_dev, bytes, m.copy);
+                        ++iss_peer;
+                    } else if (en.job < 0) {
                         cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                         ++iss_dma;
                     } else {
@@ -1576,6 +1609,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const int32_t e = order[j];
                             if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                             if (m.src->pinned(l, e)) continue;
+                            bool on_helper = false;   // peer-copied in stage_one, nothing for the stager
+                            for (const auto& h : m.helpers) on_helper = on_helper || h.second->slot_of(l, e) >= 0;
+                            if (on_helper) continue;
                             const uint8_t* b = m.src->blob(l, e);
                             if (!b) { err = "prefill: expert source has no blob"; return false; }
                             job_of[j] = (int) js.size();
@@ -1591,9 +1627,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int sl = stage_next;
                         stage_next = (stage_next + 1) % STAGE;
                         const auto th = Clock::now();
-                        const uint8_t* b = m.src->blob(l, e);
-                        if (!b) { err = "prefill: expert source has no blob"; return false; }
-                        if (m.src->pinned(l, e)) {
+                        int32_t hslot = -1;
+                        size_t hi = 0;
+                        for (; hi < m.helpers.size(); ++hi)
+                            if ((hslot = m.helpers[hi].second->slot_of(l, e)) >= 0) break;
+                        const uint8_t* b = hslot >= 0 ? nullptr : m.src->blob(l, e);
+                        if (hslot < 0 && !b) { err = "prefill: expert source has no blob"; return false; }
+                        if (hslot >= 0) {
+                            // a helper GPU holds it: peer DMA from its cache slot, no host memory touched
+                            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+                            cudaMemcpyPeerAsync(m.stage_dev[sl], m.device >= 0 ? m.device : 0, m.helpers[hi].second->device_slot(hslot),
+                                                m.helpers[hi].first, (size_t) lay.blob_bytes(l), m.copy);
+                            ++stats_.experts_peer;
+                        } else if (m.src->pinned(l, e)) {
                             // DMA straight from the page-locked arena: the copy stream only waits for the slot
                             if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
                             cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
@@ -1773,6 +1819,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             stats_.ms_experts_host += iss_ms;
             stats_.experts_streamed += iss_streamed;
             stats_.experts_dma += iss_dma;
+            stats_.experts_peer += iss_peer;
         }
         stats_.tokens += T;
         pt.mark(kPfStart, cs);

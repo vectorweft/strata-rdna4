@@ -30,6 +30,7 @@ struct PrefillStats {
     double ms_experts_host = 0;     ///< host time staging non-resident experts
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
+    int64_t experts_peer = 0;       ///< ...of which device to device from a helper GPU's expert cache
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     double ms_ple = 0;
 };
@@ -58,6 +59,10 @@ public:
     bool init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
               void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0);
+
+    /// Helper-GPU expert caches (--expert-cache-device1..3): an expert one of them holds is copied device to
+    /// device (peer DMA) into the prompt path's ring instead of being streamed from host memory.
+    void set_helper_caches(const std::vector<std::pair<int, const core::ExpertCache*>>& helpers);
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).

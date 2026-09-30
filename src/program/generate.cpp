@@ -183,6 +183,7 @@ struct Options {
     bool no_host_worker = false;
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
+    bool pin_cpu_experts = false;      ///< ... and page-locked + mapped, so prefill DMAs them straight to the GPU
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -436,6 +437,8 @@ void usage() {
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n"
                  "  --resident-cpu-experts  with mmap and a static profile, keep CPU misses resident in ordinary RAM.\n"
+                 "  --pin-cpu-experts     --resident-cpu-experts, page-locked: the prompt path DMAs those experts\n"
+                 "                       straight to the GPU instead of staging each one through a bounce buffer.\n"
                  "                       Borrowed GPU-cache entries may read from mmap during prompt prefill.\n");
 }
 
@@ -1084,6 +1087,7 @@ int main(int argc, char** argv) {
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = true;
+        else if (a == "--pin-cpu-experts") o.resident_cpu_experts = o.pin_cpu_experts = true;
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
@@ -2330,7 +2334,7 @@ int main(int argc, char** argv) {
             for (int64_t l = 0; l < g.n_layers; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (remote_experts[(size_t) r].holds(l, e)) remote_pairs.emplace_back((int32_t) l, (int32_t) e);
-        if (!src.pin_cache_complement(xcache, err, /*pin=*/false, remote_pairs)) {
+        if (!src.pin_cache_complement(xcache, err, /*pin=*/o.pin_cpu_experts, remote_pairs)) {
             std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
             return 1;
         }
@@ -3002,8 +3006,12 @@ int main(int argc, char** argv) {
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const uint64_t b = lay.blob_bytes(l);
+                if (o.expert_cache > 0 && xcache.valid() && xcache.slot_of(l, e) >= 0) continue;   // never streamed
                 total += b;
-                if (srcp->pinned(l, e)) pinned += b;
+                bool on_helper = false;   // peer DMA from a helper GPU's cache counts as copy-engine work too
+                for (int r = 0; r < 3; ++r)
+                    on_helper = on_helper || (o.expert_cache_remote[(size_t) r] > 0 && remote_experts[(size_t) r].holds(l, e));
+                if (on_helper || srcp->pinned(l, e)) pinned += b;
             }
         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
@@ -4390,6 +4398,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        {
+            std::vector<std::pair<int, const strata::core::ExpertCache*>> helpers;
+            for (int r = 0; r < 3; ++r)
+                if (o.expert_cache_remote[(size_t) r] > 0)
+                    helpers.emplace_back(remote_experts[(size_t) r].device(), &remote_experts[(size_t) r].cache());
+            if (!helpers.empty()) {
+                prefill.set_helper_caches(helpers);
+                std::fprintf(stderr, "strata generate: prompt path peer-copies experts from %zu helper GPU cache(s)\n",
+                             helpers.size());
+            }
+        }
         if (!o.mtp.empty()) {
             if (!mtp.bind(wt, &native_head, nullptr, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -4438,10 +4457,10 @@ int main(int argc, char** argv) {
         ss.ple_prev[1] = pos_start >= 1 ? (int32_t) o.tokens[(size_t) (pos_start - 1)] : -1;
         const strata::prefill::PrefillStats& ps = prefill.stats();
         std::fprintf(stderr, "strata generate: prefill %lld tokens in %lld chunks, %.1f ms (%.1f tok/s); experts "
-                             "streamed %lld (%lld by DMA, host %.1f ms), resident %lld; PLE %.1f ms\n",
+                             "streamed %lld (%lld by DMA, %lld peer, host %.1f ms), resident %lld; PLE %.1f ms\n",
                      (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
                      ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0, (long long) ps.experts_streamed,
-                     (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident, ps.ms_ple);
+                     (long long) ps.experts_dma, (long long) ps.experts_peer, ps.ms_experts_host, (long long) ps.experts_resident, ps.ms_ple);
     }
 
     for (int64_t pos = pos_start;; ++pos) {
