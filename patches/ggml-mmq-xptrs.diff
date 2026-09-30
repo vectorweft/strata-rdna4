@@ -1,0 +1,27 @@
+962c962,963
+<         const uint3 ntx) {
+---
+>         const uint3 ntx, const char * const * __restrict__ x_ptrs) {
+>     // x_ptrs (Strata): per channel (expert) the base of its weights instead of x + channel * stride_channel_x
+1057c1058
+<             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+---
+>             (x_ptrs ? x_ptrs[fastdiv(zt, channel_ratio)] : x, x_ptrs ? offset_x - fastdiv(zt, channel_ratio)*stride_channel_x : offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+1151c1152
+<             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+---
+>             (x_ptrs ? x_ptrs[fastdiv(zt, channel_ratio)] : x, x_ptrs ? offset_x - fastdiv(zt, channel_ratio)*stride_channel_x : offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+1235c1236
+<         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+---
+>         (x_ptrs ? x_ptrs[fastdiv(zt, channel_ratio)] : x, x_ptrs ? offset_x - fastdiv(zt, channel_ratio)*stride_channel_x : offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+1385a1387
+>     const char * const * x_ptrs = nullptr; // Strata: per-channel weight bases (device), or null
+1435c1437
+<              ntx_fd);
+---
+>              ntx_fd, args.x_ptrs);
+1464c1466
+<          ntx_fd);
+---
+>          ntx_fd, args.x_ptrs);

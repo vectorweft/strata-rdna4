@@ -2,6 +2,7 @@
 // from the pinned llama.cpp checkout the build already takes ggml from; src/prefill/ggml_cuda_host.cu supplies the
 // few host symbols of ggml-cuda.cu it references.
 #include "strata/prefill/moe_mmq.hpp"
+#include <algorithm>
 
 #include "common.cuh"
 #include "mmq.cuh"
@@ -127,11 +128,12 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
-    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
+    mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
                         p.max_rows, p.max_rows};
+    a.x_ptrs = (const char* const*) p.w_ptrs;
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {
@@ -155,7 +157,22 @@ void Context::run(const Product& p, void* stream) {
 }
 
 namespace {
+__global__ void gather_batch_kernel(const void* const* __restrict__ src, int64_t n16, uint4* __restrict__ dst) {
+    const int e = blockIdx.y;
+    const uint4* s = (const uint4*) src[e];
+    uint4* d = dst + (int64_t) e * n16;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (int64_t) gridDim.x * blockDim.x)
+        d[i] = s[i];
+}
 __global__ void set_bounds_kernel(int32_t* b, int32_t rows) { b[0] = 0; b[1] = rows; }
+}
+void gather_batch(const void* const* src, int n, size_t bytes, void* dst, void* stream) {
+    if (n <= 0) return;
+    if (bytes % 16 != 0 || ((uintptr_t) dst & 15) != 0) { std::fprintf(stderr, "prefill mmq: gather_batch alignment\n"); std::exit(1); }
+    const int64_t n16 = (int64_t) (bytes / 16);
+    gather_batch_kernel<<<dim3((unsigned) std::min<int64_t>((n16 + 255) / 256, 64), (unsigned) n), 256, 0, (cudaStream_t) stream>>>(
+        src, n16, (uint4*) dst);
+    ck(cudaGetLastError(), "gather_batch");
 }
 void set_bounds(int32_t* b, int64_t rows, void* stream) {
     set_bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(b, (int32_t) rows);

@@ -40,6 +40,9 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    /// optional (device array of n): each expert's weights at its own address instead of w + e * expert_bytes
+    /// (needs patches/ggml-mmq-xptrs.diff in the ggml tree)
+    const void* const* w_ptrs = nullptr;
 };
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
@@ -67,6 +70,9 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
 
+/// n experts' down matrices (`src[e]`, device pointers in a device array) into consecutive `bytes` slots at dst,
+/// one launch.
+void gather_batch(const void* const* src, int n, size_t bytes, void* dst, void* stream);
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
 /// b[0] = 0, b[1] = rows: one "expert" over every row (a dense projection through the MoE launch).

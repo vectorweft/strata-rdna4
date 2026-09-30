@@ -58,6 +58,7 @@ void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
 void set_bounds(int32_t*, int64_t, void*) {}
+void gather_batch(const void* const*, int, size_t, void*, void*) {}
 }  // namespace strata::prefill::mmq
 #endif
 
@@ -278,6 +279,8 @@ struct Prefill::Impl {
         void *Xq = nullptr, *Hq = nullptr;
         uint8_t *grp_gu = nullptr, *grp_d = nullptr;
         int32_t *src = nullptr, *bounds = nullptr, *ident = nullptr, *host = nullptr;
+        const void** ptr_host = nullptr;   // pinned [gate/up | down] per helper expert of a layer (the pointer table)
+        const void** ptr_dev = nullptr;
         std::vector<void*> dev_owned;
         int64_t experts = 0, host_experts = 0;
         // this chunk's RAM-resident experts the helper takes ([layer * n_expert + e]): it DMAs them over its own PCIe
@@ -322,6 +325,10 @@ struct Prefill::Impl {
     // the dense Q8_0 projections through MMQ too (STRATA_PREFILL_DENSE_MMQ): their q8_1 rows and {0, T}
     void* Xqd = nullptr;
     int32_t* dense_bounds = nullptr;
+    // the MMQ groups read gate/up in place (the cache slot or the ring slot) through a pointer table: [gate/up of
+    // order j | down of order j], per layer; the down matrices are still gathered (MMQ reads past a K = 640 row)
+    const void** ptr_host = nullptr;   // pinned
+    const void** ptr_dev = nullptr;
     float *xnf = nullptr, *lof = nullptr;   // the hyper-connection read's FP32 inputs for MMQ (T x 10240, T x 320)
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     std::vector<int32_t> bounds_host;
@@ -684,6 +691,11 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.Xqd = o.take<uint8_t>(mmq::q8_bytes((int64_t) T, 12288), ok);   // the widest dense input (attn_output: 6144)
         m.dense_bounds = o.take<int32_t>(2, ok);
+        m.ptr_dev = (const void**) o.take<uint64_t>((size_t) 2 * m.g->n_expert, ok);
+        if (!m.ptr_host && cudaHostAlloc((void**) &m.ptr_host, (size_t) 2 * m.g->n_expert * sizeof(void*), cudaHostAllocDefault) != cudaSuccess) {
+            m.ptr_host = nullptr;
+            cudaGetLastError();
+        }
         // (xnf / lof are not allocated: the hyper-connection read borrows the MoE buffers Dm and GU, dead between a
         // layer's combine and the next MoE product in stream order - see the hc read)
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
@@ -1062,6 +1074,7 @@ bool helper_setup(M& m) {
     dm((void**) &h.src, (size_t) h.rows_cap * 4);
     dm((void**) &h.bounds, (size_t) h.bounds_cap * 4);
     dm((void**) &h.ident, (size_t) h.rows_cap * 4);
+    dm((void**) &h.ptr_dev, (size_t) 2 * E * sizeof(void*));
     if (ok) {
         mmq::iota(h.ident, h.rows_cap, h.cs);
         h.ctx = std::make_unique<mmq::Context>();
@@ -1070,7 +1083,8 @@ bool helper_setup(M& m) {
     {
         const core::OnDevice back(m.device);
         ok = ok && cudaEventCreateWithFlags(&h.ready, cudaEventDisableTiming) == cudaSuccess &&
-             cudaHostAlloc((void**) &h.host, (size_t) (h.rows_cap + h.bounds_cap) * 4, cudaHostAllocPortable) == cudaSuccess;
+             cudaHostAlloc((void**) &h.host, (size_t) (h.rows_cap + h.bounds_cap) * 4, cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &h.ptr_host, (size_t) 2 * E * sizeof(void*), cudaHostAllocPortable) == cudaSuccess;
     }
     if (!ok) {
         cudaGetLastError();
@@ -1850,18 +1864,28 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                     uint8_t* gdst = h.grp_gu + (size_t) q * mmq_gub;
                                     uint8_t* ddst = h.grp_d + (size_t) q * mmq_db;
                                     const int32_t hs = h.cache->slot_of(l, e);
-                                    if (hs >= 0) {
+                                    const size_t jj = j0 + (size_t) q, E2 = (size_t) m.g->n_expert;
+                                    if (hs >= 0) {   // in place: gate/up read from the slot, down gathered below
                                         const uint8_t* b = h.cache->device_slot(hs);
-                                        mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db, gdst, ddst, h.cs);
+                                        h.ptr_host[jj] = b;
+                                        h.ptr_host[E2 + jj] = b + f.down_off;
                                     } else {   // a page-locked RAM expert: DMA over the helper's own link
                                         const uint8_t* b = m.src->blob(l, e);
-                                        cudaMemcpyAsync(gdst, b, mmq_gub / 2, cudaMemcpyHostToDevice, h.cs);
-                                        cudaMemcpyAsync(gdst + mmq_gub / 2, b + f.up_off, mmq_gub / 2, cudaMemcpyHostToDevice, h.cs);
+                                        cudaMemcpyAsync(gdst, b, mmq_gub, cudaMemcpyHostToDevice, h.cs);   // gate | up
                                         cudaMemcpyAsync(ddst, b + f.down_off, mmq_db, cudaMemcpyHostToDevice, h.cs);
+                                        h.ptr_host[jj] = gdst;
+                                        h.ptr_host[E2 + jj] = ddst;   // (gathered onto itself)
                                         ++h.host_experts;
                                     }
                                 }
-                                cudaMemsetAsync(h.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, h.cs);
+                                {
+                                    const size_t E2 = (size_t) m.g->n_expert;
+                                    cudaMemcpyAsync(h.ptr_dev + j0, h.ptr_host + j0, (size_t) ngx * sizeof(void*),
+                                                    cudaMemcpyHostToDevice, h.cs);
+                                    cudaMemcpyAsync(h.ptr_dev + E2 + j0, h.ptr_host + E2 + j0, (size_t) ngx * sizeof(void*),
+                                                    cudaMemcpyHostToDevice, h.cs);
+                                    mmq::gather_batch(h.ptr_dev + E2 + j0, ngx, mmq_db, h.grp_d, h.cs);
+                                }
                                 cudaMemsetAsync(h.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, h.cs);
                                 const size_t gg = j0 / MMQ_GROUP;
                                 const int64_t r0 = hb[j0], nrg = hb[j0 + (size_t) ngx] - r0;
@@ -1869,6 +1893,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 gu.w = h.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = h.Xq; gu.bounds = h.bounds + j0; gu.ids = h.ident;
                                 gu.total_rows = nr; gu.max_rows = maxr; gu.dst = h.GU; gu.ld_dst = 1280;
+                                gu.w_ptrs = h.ptr_dev + j0;
                                 h.ctx->run(gu, h.cs);
                                 mmq::swiglu(h.GU + r0 * 1280, h.H + r0 * 640, nrg, 640, !lay.native, h.cs);
                                 mmq::quantize(h.H + r0 * 640, nullptr, h.Hq, mmq_dt, 640, 640, nrg, h.cs);
@@ -1945,11 +1970,58 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         ++stats_.experts_streamed;
                         return true;
                     };
+                    // the pointer-table groups (STRATA_MMQ_PTRS, default on): the streamed walk only; a ring slot of
+                    // an open group is released once the group's gate/up product has read it, and the issuer is given
+                    // entries back only then
+                    static const bool mmq_ptrs_on = [] { const char* v = std::getenv("STRATA_MMQ_PTRS"); return !(v && v[0] == '0'); }();
+                    const bool use_ptrs = use_mmq && stream_all && lay.native && mmq_ptrs_on && m.ptr_host && m.ptr_dev;
+                    std::vector<int> grp_slots;
+                    bool group_open = false;
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                     // expert) is released once the blob is read
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                         const int32_t e = order[j];
                         pt.mark(kPfDequant, cs);
+                        if (use_mmq && use_ptrs) {
+                            // gate/up read in place through the pointer table; the down matrices gathered in one launch
+                            const size_t q = j % MMQ_GROUP;
+                            const auto& f = lay.fmt[(size_t) l];
+                            const size_t E2 = (size_t) m.g->n_expert;
+                            m.ptr_host[j] = blob_dev;
+                            m.ptr_host[E2 + j] = blob_dev + f.down_off;
+                            if (slot >= 0) { grp_slots.push_back(slot); group_open = true; }
+                            if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                            const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                            const int ngx = (int) (q + 1);
+                            const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
+                            int64_t maxr = 0;
+                            for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                            cudaMemcpyAsync(m.ptr_dev + j0, m.ptr_host + j0, (size_t) ngx * sizeof(void*), cudaMemcpyHostToDevice, m.cs);
+                            cudaMemcpyAsync(m.ptr_dev + E2 + j0, m.ptr_host + E2 + j0, (size_t) ngx * sizeof(void*),
+                                            cudaMemcpyHostToDevice, m.cs);
+                            mmq::gather_batch(m.ptr_dev + E2 + j0, ngx, mmq_db, m.grp_d, m.cs);
+                            pt.mark(kPfGemmGU, cs);
+                            cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                            mmq::Product gu;
+                            gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                            gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
+                            gu.total_rows = R_local; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                            gu.w_ptrs = m.ptr_dev + j0;
+                            m.mmq_ctx->run(gu, m.cs);
+                            for (const int sl : grp_slots) cudaEventRecord(m.used[sl], m.cs);   // gate/up read
+                            grp_slots.clear();
+                            group_open = false;
+                            mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                            mmq::Product dn;
+                            dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
+                            dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
+                            dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
+                            dn.ld_dst = N;
+                            m.mmq_ctx->run(dn, m.cs);
+                            return true;
+                        }
                         if (use_mmq) {
                             // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                             const size_t q = j % MMQ_GROUP;
@@ -2035,7 +2107,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             while (k < kend && seq[k].e < e_stop) {
                                 cudaEventRecord(m.used[k % (size_t) m.ring], m.cs);
                                 consumed = ++k;
-                                give_back(consumed);
+                                if (!group_open) give_back(consumed);
                             }
                         };
                         for (size_t j = 0; j < order.size(); ++j) {
@@ -2048,10 +2120,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
                                 if (!compute(j, m.stage_dev[sl], sl)) return false;
                                 consumed = ++k;
-                                give_back(consumed);
+                                if (!group_open) give_back(consumed);
                             } else {
                                 ++stats_.experts_resident;
                                 if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                if (!group_open) give_back(consumed);   // (a group closed by a resident expert)
                             }
                         }
                         release_to(m.g->n_expert);
