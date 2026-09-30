@@ -38,6 +38,8 @@ public:
     bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
     bool finish(float* out, std::string& err);
     int64_t resident() const { return cache_.resident(); }
+    /// Whether this device's cache holds (layer, expert).
+    bool holds(int64_t layer, int64_t expert) const { return cache_.valid() && cache_.slot_of(layer, expert) >= 0; }
     int64_t computed() const { return computed_; }
     int64_t launched_layers() const { return launched_layers_; }
     double gib() const { return cache_.gib(); }

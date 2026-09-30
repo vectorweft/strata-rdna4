@@ -1156,10 +1156,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts, a static --expert-profile and --adapt-every 0\n");
         return 2;
     }
-    if (o.resident_cpu_experts &&
-        (!o.layer_split.empty() || o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
-         o.expert_cache_remote[2] > 0)) {
-        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
+    if (o.resident_cpu_experts && !o.layer_split.empty()) {
+        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits\n");
         return 2;
     }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
@@ -2193,13 +2191,6 @@ int main(int argc, char** argv) {
                      (long long) prefilled, (long long) want);
     }
 
-    if (o.resident_cpu_experts) {
-        if (!src.pin_cache_complement(xcache, err, /*pin=*/false)) {
-            std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
-            return 1;
-        }
-        std::fprintf(stderr, "strata generate: steady-state CPU cache misses are resident in ordinary RAM; borrowed cache entries may use mmap during prompt prefill\n");
-    }
 
     for (auto& stp : stages) {
         GpuStage& st = *stp;
@@ -2330,6 +2321,22 @@ int main(int argc, char** argv) {
                                  "results return through pinned host rows\n", remote_dev[r],
                          (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
         }
+    }
+
+    // after every GPU cache is filled: only what none of them holds stays on the CPU, so only that is made resident
+    if (o.resident_cpu_experts) {
+        std::vector<std::pair<int32_t, int32_t>> remote_pairs;
+        for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (remote_experts[(size_t) r].holds(l, e)) remote_pairs.emplace_back((int32_t) l, (int32_t) e);
+        if (!src.pin_cache_complement(xcache, err, /*pin=*/false, remote_pairs)) {
+            std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: steady-state CPU cache misses are resident in ordinary RAM (%zu experts "
+                             "on helper GPUs excluded); borrowed cache entries may use mmap during prompt prefill\n",
+                     remote_pairs.size());
     }
 
     Drive drive;
