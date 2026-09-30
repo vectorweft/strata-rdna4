@@ -643,6 +643,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 16, grp);
         gr_read_group(1, true, inj_, inj2_);
+        stamp(l, 15, grp);   // (profile: the FFN half's hc read ends here; 17 is then router + plan + publish)
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
@@ -840,7 +841,7 @@ std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
-                                          "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
+                                          "attention", "gate", "hc-read1", "out-proj", "router+plan", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
                                           "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "", ""};
     std::string out;
@@ -881,6 +882,23 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
+#if defined(STRATA_USE_HIP)   // HIP: node counts by type (kernel names are not queryable the same way)
+    if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {
+        size_t nn = 0;
+        cudaGraphGetNodes(graph, nullptr, &nn);
+        std::vector<hipGraphNode_t> nodes(nn);
+        hipGraphGetNodes(graph, nodes.data(), &nn);
+        int by_type[16] = {};
+        for (hipGraphNode_t nd : nodes) {
+            hipGraphNodeType ty;
+            if (hipGraphNodeGetType(nd, &ty) == hipSuccess && (int) ty >= 0 && (int) ty < 16) ++by_type[(int) ty];
+        }
+        std::fprintf(stderr, "strata verify: %d-token window graph: %zu nodes (kernel %d, memcpy %d, memset %d, other %zu)\n",
+                     T, nn, by_type[hipGraphNodeTypeKernel], by_type[hipGraphNodeTypeMemcpy],
+                     by_type[hipGraphNodeTypeMemset],
+                     nn - by_type[hipGraphNodeTypeKernel] - by_type[hipGraphNodeTypeMemcpy] - by_type[hipGraphNodeTypeMemset]);
+    }
+#endif
 #if !defined(STRATA_USE_HIP)   // a CUDA debug listing (node types, kernel names)
     if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // what the window graph holds
         size_t nn = 0;
@@ -1101,6 +1119,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const int kind = is_qsa_layer(g, l) ? 1 : 0;
             unsigned long long prev = at(l, 0);
             for (int i = 1; i <= 24; ++i) {
+                if (i == 15) continue;   // stamped after 16 (the FFN half's hc read), split out below
                 const unsigned long long x = at(l, i);
                 if (x == 0 || x < prev) continue;
                 prof_sum_[kind][i] += (double) (x - prev);
@@ -1111,6 +1130,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             prof_sum_[kind][28] += (double) (at(l, 28) - at(l, 27));   //           down
             prof_sum_[kind][29] += (double) (at(l, 1) - at(l, 28));    //           up
             prof_sum_[kind][1] -= (double) (at(l, 1) - at(l, 0));      // (hc-read0 shown split)
+            if (at(l, 15) >= at(l, 16) && at(l, 17) >= at(l, 15)) {   // the FFN half's hc read, split from 17
+                prof_sum_[kind][15] += (double) (at(l, 15) - at(l, 16));
+                prof_sum_[kind][17] -= (double) (at(l, 15) - at(l, 16));
+            }
         }
         prof_sum_[0][26] += (double) (at(L, 1) - at(L, 0));
         ++prof_windows_;
