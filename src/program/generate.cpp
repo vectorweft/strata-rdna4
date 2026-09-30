@@ -1169,10 +1169,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts, a static --expert-profile and --adapt-every 0\n");
         return 2;
     }
-    if (o.resident_cpu_experts && !o.layer_split.empty()) {
-        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits\n");
-        return 2;
-    }
+
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
@@ -2338,11 +2335,15 @@ int main(int argc, char** argv) {
 
     // after every GPU cache is filled: only what none of them holds stays on the CPU, so only that is made resident
     if (o.resident_cpu_experts) {
-        std::vector<std::pair<int32_t, int32_t>> remote_pairs;
+        std::vector<std::pair<int32_t, int32_t>> remote_pairs;   // held by a helper GPU or a later layer-split stage
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
             for (int64_t l = 0; l < g.n_layers; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (remote_experts[(size_t) r].holds(l, e)) remote_pairs.emplace_back((int32_t) l, (int32_t) e);
+        for (auto& stp : stages)
+            for (int64_t l = stp->lb; l < stp->le; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (stp->cache.slot_of(l, e) >= 0) remote_pairs.emplace_back((int32_t) l, (int32_t) e);
         if (!src.pin_cache_complement(xcache, err, /*pin=*/o.pin_cpu_experts, remote_pairs)) {
             std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
             return 1;
@@ -3135,6 +3136,13 @@ int main(int argc, char** argv) {
                                      "off (setup: --vision no), close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
+        }
+        {   // the helper GPUs' caches feed the prompt path by peer copies (as in the one-shot path)
+            std::vector<std::pair<int, const strata::core::ExpertCache*>> helpers;
+            for (int r = 0; r < 3; ++r)
+                if (o.expert_cache_remote[(size_t) r] > 0)
+                    helpers.emplace_back(remote_experts[(size_t) r].device(), &remote_experts[(size_t) r].cache());
+            if (!helpers.empty()) sp.set_helper_caches(helpers);
         }
         mem_mark("the head and the prompt path");
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
