@@ -24,6 +24,8 @@
 #include <cstdlib>
 #include <random>
 #include <string>
+#include <memory>
+#include <regex>
 #include <vector>
 
 namespace cpu = strata::kernels::cpu;
@@ -37,7 +39,24 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
     if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...]\n"); return 2; }
-    strata::GgufFile gguf(argv[1]);
+    // every shard of a split model (<name>-0000N-of-0000M.gguf): a layer's experts may sit in any of them
+    std::vector<std::unique_ptr<strata::GgufFile>> shards;
+    {
+        const std::string first = argv[1];
+        const std::regex split("-(\\d{5})-of-(\\d{5})\\.gguf$");
+        std::smatch m;
+        if (std::regex_search(first, m, split)) {
+            const int total = std::stoi(m[2].str());
+            const std::string stem = first.substr(0, (size_t) m.position(0));
+            for (int i = 1; i <= total; ++i) {
+                char tail[32];
+                std::snprintf(tail, sizeof tail, "-%05d-of-%05d.gguf", i, total);
+                shards.push_back(std::make_unique<strata::GgufFile>(stem + tail));
+            }
+        } else {
+            shards.push_back(std::make_unique<strata::GgufFile>(first));
+        }
+    }
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
     if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
@@ -48,10 +67,12 @@ int main(int argc, char** argv) {
     cudaStreamCreate(&s);
     for (int l : layers) {
         const strata::TensorInfo* t[3] = {};
+        const strata::GgufFile* owner[3] = {};
         const char* roles[3] = {"gate", "up", "down"};
-        for (const auto& ti : gguf.tensors())
-            for (int r = 0; r < 3; ++r)
-                if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
+        for (const auto& g : shards)
+            for (const auto& ti : g->tensors())
+                for (int r = 0; r < 3; ++r)
+                    if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") { t[r] = &ti; owner[r] = g.get(); }
         if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
         cpu::NativeFmt f;
         std::string err;
@@ -59,9 +80,9 @@ int main(int argc, char** argv) {
             std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
         }
         std::vector<uint8_t> blob(f.bytes);
-        std::memcpy(blob.data(), gguf.tensor_data(*t[0]) + (size_t) E * f.up_off, f.up_off);
-        std::memcpy(blob.data() + f.up_off, gguf.tensor_data(*t[1]) + (size_t) E * f.up_off, f.up_off);
-        std::memcpy(blob.data() + f.down_off, gguf.tensor_data(*t[2]) + (size_t) E * (f.bytes - f.down_off),
+        std::memcpy(blob.data(), owner[0]->tensor_data(*t[0]) + (size_t) E * f.up_off, f.up_off);
+        std::memcpy(blob.data() + f.up_off, owner[1]->tensor_data(*t[1]) + (size_t) E * f.up_off, f.up_off);
+        std::memcpy(blob.data() + f.down_off, owner[2]->tensor_data(*t[2]) + (size_t) E * (f.bytes - f.down_off),
                     f.bytes - f.down_off);
         // (a) the float reference
         const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);

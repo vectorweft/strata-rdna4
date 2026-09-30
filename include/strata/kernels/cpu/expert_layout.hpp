@@ -23,8 +23,9 @@ struct ExpertLayout {
     /// Plan v0.3 P6: per layer, the absolute offsets of the gate / up / down tensors in the model's shard 1, so
     /// the arena can be filled from the GGUF itself when the pack has no experts.bin (3 x n_layers, 0 = unknown).
     std::vector<uint64_t> gguf_off;
-    /// Per layer, the GGUF file (a name beside the --native shard) that holds its experts when the model's
-    /// shards split the layers (Swift's GGUFs: layers 13-47 in shard 2).  Empty = the --native shard itself.
+    /// Per layer and role (3 x n_layers: gate, up, down), the GGUF file (a name beside the --native shard) that
+    /// holds those experts when the model's shards split the layers (Swift's GGUFs: layers 13-47 in shard 2;
+    /// Unsloth's UD-Q4_K_XL: layer 11's gate in shard 1, its up/down in shard 2).  Empty = the --native shard.
     std::vector<std::string> gguf_file;
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size

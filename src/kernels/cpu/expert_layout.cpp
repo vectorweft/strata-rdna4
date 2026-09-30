@@ -122,10 +122,20 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             L.gguf_off[(size_t) (3 * l)] = go;
             L.gguf_off[(size_t) (3 * l + 1)] = uo;
             L.gguf_off[(size_t) (3 * l + 2)] = dox;
-            std::string file;             // v3: the shard that holds this layer (a file name beside --native)
-            if (ss >> file) {
-                if (L.gguf_file.empty()) L.gguf_file.assign((size_t) n_layers, std::string());
-                L.gguf_file[(size_t) l] = file;
+            // v3: one shard name for the whole layer; v4: one per role (gate up down), "-" = the --native shard
+            std::string files[3];
+            int n_files = 0;
+            while (n_files < 3 && ss >> files[n_files]) ++n_files;
+            if (n_files == 2) {
+                err = "native_experts.txt: layer " + std::to_string(l) + " names 2 shards (want 1 or 3)";
+                return false;
+            }
+            if (n_files > 0) {
+                if (L.gguf_file.empty()) L.gguf_file.assign((size_t) (3 * n_layers), std::string());
+                for (int r = 0; r < 3; ++r) {
+                    const std::string& f = files[n_files == 1 ? 0 : r];
+                    L.gguf_file[(size_t) (3 * l + r)] = f == "-" ? std::string() : f;
+                }
             }
         }
         L.fmt[(size_t) l] = f;
