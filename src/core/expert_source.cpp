@@ -964,6 +964,29 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    {   // debug (STRATA_POOL_LAYERS=1): per layer, the pool's time and its CPU share, printed at exit
+        static const bool pl = std::getenv("STRATA_POOL_LAYERS") != nullptr;
+        constexpr int kL = 128;
+        static double t_all[kL], t_run[kL];
+        static long n_jobs[kL], n_cpu[kL], n_calls[kL];
+        if (pl && d.layers >= 0 && d.layers < kL) {
+            const int L = (int) d.layers;
+            t_all[L] += ms(c0, c4); t_run[L] += ms(c3, c4); n_jobs[L] += njobs; ++n_calls[L];
+            for (int64_t i = 0; i < n_tok * k; ++i) n_cpu[L] += kind[i] == -1;
+            static const bool reg = [] {
+                std::atexit([] {
+                    for (int l = 0; l < kL; ++l)
+                        if (n_calls[l])
+                            std::fprintf(stderr, "pool layer %3d: %7.1f us total, %7.1f us CPU run + helper wait, %.2f CPU "
+                                                 "experts, %.2f CPU entries\n", l, 1000 * t_all[l] / n_calls[l],
+                                         1000 * t_run[l] / n_calls[l], (double) n_jobs[l] / n_calls[l],
+                                         (double) n_cpu[l] / n_calls[l]);
+                });
+                return true;
+            }();
+            (void) reg;
+        }
+    }
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);

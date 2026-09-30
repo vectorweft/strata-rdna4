@@ -525,6 +525,74 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     }
 }
 
+// The fused gate/up pass (STRATA_EXPERT_FUSED, default on): a block owns 32 consecutive ff rows - one q8_1 block of
+// h per entry - computes their gate AND up dots, the SwiGLU, and writes h already quantized, so the separate
+// swiglu and quantize launches (and the gate/up/h round trips through memory) are gone.  Every value is the
+// unfused path's bit for bit: the same lane-strided dots (unrolled here, n_embd fixed), the same SwiGLU expression,
+// and the q8_1 block reduced by one warp in quantize_q8_1_kernel's order.
+constexpr int GUF_R = 32;      // ff rows per block
+constexpr int GUF_E = 8;       // entries staged at a time
+
+template<int TY, int NCALL>
+__device__ __forceinline__ float row_dot_n(const uint8_t* row, const block_q8_1* x, int lane) {
+    using F = Fmt<TY>;
+    float s = 0.0f;
+#pragma unroll
+    for (int it = 0; it < (NCALL + 31) / 32; ++it) {
+        const int k = lane + 32 * it;
+        if (k < NCALL) {
+            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+            s += F::dot(row, x + kbx * (F::qk / 32), kbx, iqs);
+        }
+    }
+    return warp_sum(s);
+}
+
+template<int TG, int NEMBD>
+__global__ void __launch_bounds__(32 * GUF_R) native_gu_fused_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                     const int32_t* __restrict__ grp_start,
+                                                                     const int32_t* __restrict__ n_groups,
+                                                                     const int32_t* __restrict__ ent_tok,
+                                                                     const block_q8_1* __restrict__ xq,
+                                                                     NativeExpertLayout L, block_q8_1* __restrict__ hq) {
+    constexpr int NCALL = NEMBD / Fmt<TG>::qk * Fmt<TG>::ipb, XB = NEMBD / 32;
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    __shared__ float hs[GUF_E][GUF_R];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;   // warp = the ff row of this block
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const int hb = (int) (L.n_ff / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    const int r = blockIdx.x * GUF_R + warp;
+    const uint8_t* wg = blob + (size_t) r * L.gu_row;
+    const uint8_t* wu = blob + L.up_off + (size_t) r * L.gu_row;
+    for (int eb = e0; eb < e1; eb += GUF_E) {
+        const int ne = e1 - eb < GUF_E ? e1 - eb : GUF_E;
+        for (int e = 0; e < ne; ++e) {
+            const block_q8_1* x = xq + (size_t) ent_tok[eb + e] * XB;
+            const float gv = row_dot_n<TG, NCALL>(wg, x, lane);
+            const float uv = row_dot_n<TG, NCALL>(wu, x, lane);
+            if (lane == 0) hs[e][warp] = (gv / (1.0f + __expf(-gv))) * uv;
+        }
+        __syncthreads();
+        if (warp < ne) {
+            const float xi = hs[warp][lane];
+            float amax = fabsf(xi), sum = xi;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            }
+            const float d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+            block_q8_1& b = hq[(size_t) (eb + warp) * hb + blockIdx.x];
+            b.qs[lane] = q;
+            if (lane == 0) b.ds = make_half2(d, sum);
+        }
+        __syncthreads();
+    }
+}
+
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
 __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
@@ -929,8 +997,27 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     float* h = (float*) ((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
+    static const bool fused = [] { const char* v = std::getenv("STRATA_EXPERT_FUSED"); return !(v && v[0] == '0'); }();
+    const bool fuse = fused && L.n_embd == 2560 && L.n_ff % GUF_R == 0;
+    if (fuse) {
+        const dim3 gf((unsigned) (L.n_ff / GUF_R), (unsigned) cap_groups);
+        switch (L.gu_type) {
+            case 16: native_gu_fused_kernel<16, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 17: native_gu_fused_kernel<17, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 18: native_gu_fused_kernel<18, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 21: native_gu_fused_kernel<21, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 22: native_gu_fused_kernel<22, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 23: native_gu_fused_kernel<23, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 29: native_gu_fused_kernel<29, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 42: native_gu_fused_kernel<42, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 12: native_gu_fused_kernel<12, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 13: native_gu_fused_kernel<13, 2560><<<gf, 32 * GUF_R, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
+        }
+        check("native_expert_grouped/gu fused");
+    }
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
-    switch (L.gu_type) {
+    if (!fuse) switch (L.gu_type) {
         case 16: native_gu_kernel<16><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 17: native_gu_kernel<17><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 18: native_gu_kernel<18><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
@@ -943,10 +1030,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 13: native_gu_kernel<13><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
     }
-    check("native_expert_grouped/gu");
-    const long long nh = (long long) cap_entries * L.n_ff;
-    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
-    quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+    if (!fuse) {
+        check("native_expert_grouped/gu");
+        const long long nh = (long long) cap_entries * L.n_ff;
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+    }
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

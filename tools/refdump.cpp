@@ -139,8 +139,24 @@ int main(int argc, char ** argv) {
     if (!ctx) { std::fprintf(stderr, "refdump: no context\n"); return 1; }
     for (size_t at = 0; at < toks.size(); at += 2048) {   // in batch-sized pieces
         const int32_t n = (int32_t) std::min<size_t>(2048, toks.size() - at);
+        // REFDUMP_ALL_OUTPUTS=1: every token is an output, so llama.cpp computes the LAST layer for every row too
+        // (with one output per batch it gathers the output rows before that layer's FFN, and a routing trace then
+        // holds 1 record of layer n-1 per batch: a profile built from it leaves the last layer's experts uncached)
+        static const bool all_out = std::getenv("REFDUMP_ALL_OUTPUTS") != nullptr;
         llama_batch b = llama_batch_get_one(toks.data() + at, n);
-        if (llama_decode(ctx, b) != 0) { std::fprintf(stderr, "refdump: decode failed\n"); return 1; }
+        llama_batch ba{};
+        if (all_out) {
+            ba = llama_batch_init(n, 0, 1);
+            for (int32_t i = 0; i < n; ++i) {
+                ba.token[i] = toks[at + i]; ba.pos[i] = (llama_pos) (at + i); ba.n_seq_id[i] = 1;
+                ba.seq_id[i][0] = 0; ba.logits[i] = 1;
+            }
+            ba.n_tokens = n;
+            b = ba;
+        }
+        const int rc = llama_decode(ctx, b);
+        if (all_out) llama_batch_free(ba);
+        if (rc != 0) { std::fprintf(stderr, "refdump: decode failed\n"); return 1; }
     }
     if (c.trace) std::fclose(c.trace);
     const float * logits = llama_get_logits_ith(ctx, -1);

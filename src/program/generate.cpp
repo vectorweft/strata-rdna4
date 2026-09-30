@@ -5033,6 +5033,14 @@ int main(int argc, char** argv) {
             std::printf("%-24s plan %.3f  activation quantize %.3f  jobs %.3f  run %.3f ms/round\n", "dispatch",
                         drive.d.ms_plan / rounds, drive.d.ms_actq / rounds, drive.d.ms_jobs / rounds,
                         drive.d.ms_run / rounds);
+        for (int r = 0; r < 3 && rounds > 0; ++r)
+            if (o.expert_cache_remote[(size_t) r] > 0)
+                std::printf("%-24s host staging+launching %.3f  waiting %.3f ms/round; %.1f active layers/round, %.2f "
+                            "entries/layer\n", ("helper CUDA" + std::to_string(r + 1)).c_str(),
+                            remote_experts[(size_t) r].ms_begin() / rounds, remote_experts[(size_t) r].ms_wait() / rounds,
+                            (double) remote_experts[(size_t) r].launched_layers() / rounds,
+                            (double) remote_experts[(size_t) r].computed() /
+                                std::max<double>(1.0, (double) remote_experts[(size_t) r].launched_layers()));
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
