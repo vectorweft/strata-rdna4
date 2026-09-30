@@ -34,6 +34,29 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
                                      float freq_base, void* stream);
 
+/// The verify commit of n_layers QSA layers in one launch: layer l's tail restored from tail_snap + l * snap_stride
+/// ((idx_block - 1) * 128 floats), then n appends in order of raw + l * raw_layer_stride + t * 128 at the device
+/// positions pos[t] (negative: skipped).  Bitwise the per-layer copy + n native_qsa_indexer_append calls.
+struct QsaIndexerCommit {
+    static constexpr int kMaxLayers = 32;
+    const float* raw = nullptr;
+    size_t raw_layer_stride = 0;
+    const int32_t* pos = nullptr;
+    int n = 0;
+    int32_t pos_base = 0;
+    float epsilon = 1e-6f;
+    const float* tail_snap = nullptr;
+    size_t snap_stride = 0;
+    int n_layers = 0;
+    const float* gamma[kMaxLayers] = {};
+    float* tail[kMaxLayers] = {};
+    float* dead[kMaxLayers] = {};
+    float* pooled[kMaxLayers] = {};
+    int32_t* block_pos[kMaxLayers] = {};
+};
+void native_qsa_indexer_commit(const QsaIndexerCommit& c, const QsaShapes& s, int64_t max_cells, float freq_base,
+                               void* stream);
+
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device,
                                int32_t pos_base, const float* gamma, float epsilon,
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,

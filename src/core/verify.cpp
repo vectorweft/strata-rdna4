@@ -963,7 +963,48 @@ bool Verifier::capture_commit(std::string& err) {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        for (int64_t l = lb_; l < le_ && ok; ++l) {
+        // Batched (default): the stage's GDN layers in two launches and its QSA layers in one, instead of 2 per GDN
+        // layer and 1 + max_t per QSA layer; the per-layer state updates (48 blocks each) now run side by side.
+        // Every buffer ends bitwise as the loop below leaves it.  STRATA_COMMIT_BATCH=0: the loop.
+        static const bool batch = [] { const char* v = std::getenv("STRATA_COMMIT_BATCH"); return !(v && v[0] == '0'); }();
+        int64_t n_gdn = 0, n_qsa = 0;
+        for (int64_t l = lb_; l < le_; ++l) (is_qsa_layer(g, l) ? n_qsa : n_gdn) += 1;
+        if (batch && n_qsa <= QsaIndexerCommit::kMaxLayers) {
+            const uint64_t SV = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+            float* state0 = ss.gdn_state + (size_t) gdn_index * gdn_floats;
+            gdn_conv_commit_layers(state0 + SV, gdn_floats, qkv_L_ + (size_t) gdn_index * MT * C, (size_t) (MT * C), (int) C,
+                                   (int) n_gdn, commit_, cs_);
+            gdn_step_commit_layers(state0, gdn_floats, h_L_ + (size_t) gdn_index * MT * C, (size_t) (MT * C), (int) C,
+                                   gate_L_ + (size_t) gdn_index * MT * HV, beta_L_ + (size_t) gdn_index * MT * HV,
+                                   (size_t) (MT * HV), (int) g.ssm_k_heads, (int) HV, (int) MT, (int) n_gdn, commit_, cs_);
+            QsaIndexerCommit qc;
+            qc.raw = idx_raw_L_ + (size_t) qsa_index * MT * ID;
+            qc.raw_layer_stride = (size_t) (MT * ID);
+            qc.pos = commit_ + 2;
+            qc.n = (int) MT;
+            qc.pos_base = 0;
+            qc.epsilon = EPS;
+            qc.tail_snap = tail_snap_ + (size_t) qsa_index * TS;
+            qc.snap_stride = (size_t) TS;
+            int64_t max_cells = 0;
+            for (int64_t l = lb_; l < le_ && ok; ++l) {
+                if (!is_qsa_layer(g, l)) continue;
+                const LayerView v(*wt_, l);
+                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
+                if (!wikn) { ok = false; break; }
+                const QsaState& st = ss.qsa_states[qsa_index + qc.n_layers];
+                qc.gamma[qc.n_layers] = (const float*) wikn->data;
+                qc.tail[qc.n_layers] = st.idx_tail;
+                qc.dead[qc.n_layers] = st.idx_dead;
+                qc.pooled[qc.n_layers] = st.idx_pooled;
+                qc.block_pos[qc.n_layers] = st.idx_block_pos;
+                if (qc.n_layers > 0 && st.max_cells != max_cells) { err = "verify commit: QSA layers differ in capacity"; ok = false; }
+                max_cells = st.max_cells;
+                ++qc.n_layers;
+            }
+            if (ok) native_qsa_indexer_commit(qc, s, max_cells, (float) qsa_freq_base(), cs_);
+        }
+        for (int64_t l = lb_; l < le_ && ok && !(batch && n_qsa <= QsaIndexerCommit::kMaxLayers); ++l) {
             const LayerView v(*wt_, l);
             if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);

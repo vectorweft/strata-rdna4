@@ -39,12 +39,12 @@ __device__ float warp_sum(float x) {
         x += __shfl_xor_sync(0xffffffffu, x, offset);
     return x;
 }
-__global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+__device__ __forceinline__ void append_body(const float* __restrict__ raw, const int pos,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
                         float* __restrict__ tail, float* __restrict__ dead,
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,
                         int max_cells, float theta_scale, const int32_t* __restrict__ mtab) {
-    const int pos = *pos_dev, d = threadIdx.x;
+    const int d = threadIdx.x;
     if (pos < 0 || pos >= max_cells) return;
     const int slot = pos % R;
     float incoming = 0.0f;
@@ -92,6 +92,23 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
     if (pos == 0) dead[d] = y;
     else pooled[std::size_t(b + 1) * D + d] = dead[d];
     if (d == 0 && pos != 0) *block_pos = rope_pos;
+}
+__global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+                        int pos_base, const float* __restrict__ gamma, float epsilon,
+                        float* __restrict__ tail, float* __restrict__ dead,
+                        float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                        int max_cells, float theta_scale, const int32_t* __restrict__ mtab) {
+    append_body(raw, *pos_dev, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells, theta_scale, mtab);
+}
+// the verify commit: block = one layer; its tail restored from the window's snapshot, then the n appends in order
+__global__ void append_commit(QsaIndexerCommit c, int max_cells, float theta_scale, const int32_t* __restrict__ mtab) {
+    const int l = blockIdx.x;
+    for (int i = threadIdx.x; i < (R - 1) * D; i += blockDim.x) c.tail[l][i] = c.tail_snap[(size_t) l * c.snap_stride + i];
+    for (int t = 0; t < c.n; ++t) {
+        __syncthreads();   // the tail (restored, or the previous append's) and the shared scratch are settled
+        append_body(c.raw + (size_t) l * c.raw_layer_stride + (size_t) t * D, c.pos[t], c.pos_base, c.gamma[l],
+                    c.epsilon, c.tail[l], c.dead[l], c.pooled[l], c.block_pos[l], max_cells, theta_scale, mtab);
+    }
 }
 // ---- C-2: the batched append.  The pooled key of a completed block b (its last cell pos = 4b+3), computed with
 // the single append's arithmetic: keys rounded through F16, summed tail[0]+tail[1]+tail[2]+incoming in that order,
@@ -198,6 +215,20 @@ bool overlaps(Span a, Span b) {
 
 void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxed); }
+void native_qsa_indexer_commit(const QsaIndexerCommit& c, const QsaShapes& s, int64_t max_cells, float freq_base,
+                               void* stream) {
+    if (c.n_layers <= 0 || c.n < 1) return;
+    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT || c.n_layers > QsaIndexerCommit::kMaxLayers ||
+        max_cells < 1 || max_cells > INT32_MAX || c.pos_base < 0 || c.pos_base % R || !std::isfinite(freq_base) ||
+        freq_base <= 1.0f || !std::isfinite(c.epsilon) || c.epsilon <= 0.0f)
+        throw std::invalid_argument("native QSA indexer commit: bad geometry or parameters");
+    const float theta_scale = powf(freq_base, -2.0f / ROT);
+    append_commit<<<c.n_layers, THREADS, 0, static_cast<cudaStream_t>(stream)>>>(c, int(max_cells), theta_scale,
+                                                                                  mrope_table());
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
                                const float* gamma, float epsilon, const QsaIndexerBuffers& b,
                                const QsaShapes& s, int64_t max_cells, float freq_base, void* stream) {

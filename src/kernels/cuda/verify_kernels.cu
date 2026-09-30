@@ -50,7 +50,9 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(const float* __res
 }
 
 __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
-                                       const int32_t* __restrict__ n_keep) {
+                                       const int32_t* __restrict__ n_keep, size_t hist_stride, size_t qkv_stride) {
+    hist += blockIdx.y * hist_stride;   // (blockIdx.y: the layer of a batched commit)
+    qkv += blockIdx.y * qkv_stride;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     const int n = *n_keep;
@@ -118,7 +120,12 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
                                                                      const float* __restrict__ z,
                                                                      const float* __restrict__ gamma, float eps,
                                                                      float* __restrict__ y, int h_k, int h_v, int T,
-                                                                     const int32_t* __restrict__ n_keep, int t_out_begin) {
+                                                                     const int32_t* __restrict__ n_keep, int t_out_begin,
+                                                                     size_t state_stride, size_t h_stride, size_t gb_stride) {
+    state += blockIdx.y * state_stride;   // (blockIdx.y: the layer of a batched commit)
+    hbuf += blockIdx.y * h_stride;
+    gate += blockIdx.y * gb_stride;
+    beta += blockIdx.y * gb_stride;
     __shared__ float sk[S], sq[S];
     __shared__ float red[RG][S];
     __shared__ float wsum[S * RG / 32];
@@ -393,8 +400,16 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
 
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {
     gdn_conv_commit_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(history, qkv,
-                                                                                                 channels, n_keep);
+                                                                                                 channels, n_keep, 0, 0);
     check("gdn_conv_commit");
+}
+
+void gdn_conv_commit_layers(float* history, size_t history_stride, const float* qkv, size_t qkv_stride, int channels,
+                            int n_layers, const int32_t* n_keep, void* stream) {
+    if (n_layers <= 0) return;
+    gdn_conv_commit_kernel<<<dim3((unsigned) ((channels + 255) / 256), (unsigned) n_layers), 256, 0,
+                             (cudaStream_t) stream>>>(history, qkv, channels, n_keep, history_stride, qkv_stride);
+    check("gdn_conv_commit_layers");
 }
 
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
@@ -417,8 +432,23 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::exit(1);
     }
     gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
-        state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+        state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, 0, 0, 0);
     check("gdn_step_norm_multi");
+}
+
+void gdn_step_commit_layers(float* state, size_t state_stride, const float* h, size_t h_stride, int conv_channels,
+                            const float* gate, const float* beta, size_t gb_stride, int h_k, int h_v, int n_tok,
+                            int n_layers, const int32_t* n_keep, void* stream) {
+    if (n_layers <= 0) return;
+    if (!state || !h || !gate || !beta || !n_keep || h_k <= 0 || h_v % h_k || n_tok < 1 || n_tok > kVerifyMaxT) {
+        std::fprintf(stderr, "gdn_step_commit_layers: invalid arguments\n");
+        std::exit(1);
+    }
+    // t_out_begin = n_tok: every token is a replay, no outputs (z, gamma, y are never read or written)
+    gdn_step_norm_multi_kernel<<<dim3((unsigned) h_v, (unsigned) n_layers), dim3(S, RG), 0, (cudaStream_t) stream>>>(
+        state, h, conv_channels, gate, beta, h, gate, 1e-6f, nullptr, h_k, h_v, n_tok, n_keep, n_tok, state_stride,
+        h_stride, gb_stride);
+    check("gdn_step_commit_layers");
 }
 
 namespace {
