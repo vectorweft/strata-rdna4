@@ -417,7 +417,7 @@ void usage() {
                  "                       GPU via `moe_hit_grouped_s2`.  DEFAULT 0.  Measured at 4096 slots\n"
                  "                       with --expert-cache-per-layer: 54.4%% hits, CPU pool drain 19.1 -> 10.3\n"
                  "                       ms/token, -2.7 ms/token end to end.\n"
-                 "  --expert-cache-device1 N  pre-fill N experts on CUDA1 (experimental)\n"
+                 "  --expert-cache-device1 N|auto  pre-fill N experts on CUDA1 (auto: as many as its free memory holds)\n"
                  "  --expert-cache-device2 N  pre-fill N more experts on CUDA2\n"
                  "  --expert-cache-device3 N  pre-fill N more experts on CUDA3\n"
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
@@ -1004,9 +1004,18 @@ int main(int argc, char** argv) {
             const std::string v = next("--expert-cache");
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
-        else if (a == "--expert-cache-device1") o.expert_cache_remote[0] = std::atoi(next("--expert-cache-device1"));
-        else if (a == "--expert-cache-device2") o.expert_cache_remote[1] = std::atoi(next("--expert-cache-device2"));
-        else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = std::atoi(next("--expert-cache-device3"));
+        else if (a == "--expert-cache-device1") {
+            const std::string v = next("--expert-cache-device1");
+            o.expert_cache_remote[0] = v == "auto" ? strata::core::RemoteExperts::kAutoSlots : std::atoi(v.c_str());
+        }
+        else if (a == "--expert-cache-device2") {
+            const std::string v = next("--expert-cache-device2");
+            o.expert_cache_remote[1] = v == "auto" ? strata::core::RemoteExperts::kAutoSlots : std::atoi(v.c_str());
+        }
+        else if (a == "--expert-cache-device3") {
+            const std::string v = next("--expert-cache-device3");
+            o.expert_cache_remote[2] = v == "auto" ? strata::core::RemoteExperts::kAutoSlots : std::atoi(v.c_str());
+        }
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));

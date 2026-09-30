@@ -16,6 +16,8 @@ namespace strata::core {
 /// dense weights and state; results return through the existing pinned CPU rows.
 class RemoteExperts {
 public:
+    /// `open`'s slot count for "as many as fit" (--expert-cache-deviceN auto)
+    static constexpr int kAutoSlots = 1 << 30;
     RemoteExperts() = default;
     ~RemoteExperts();
     RemoteExperts(const RemoteExperts&) = delete;

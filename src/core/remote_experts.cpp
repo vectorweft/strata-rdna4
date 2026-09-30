@@ -134,13 +134,25 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     device_ = device;
     n_expert_ = experts;
     const auto& lay = strata::kernels::cpu::expert_layout();
+    // slots == kAutoSlots: as many as the device's free memory holds, in rank order, leaving the reserve below
+    const bool auto_size = slots == kAutoSlots;
+    constexpr uint64_t kReserve = 512ull << 20;
+    size_t free_before = 0, total_before = 0;
+    if (!check(cudaMemGetInfo(&free_before, &total_before), "free memory", err, device)) return false;
+    const uint64_t budget = free_before > kReserve + (128ull << 20) ? free_before - kReserve - (128ull << 20) : 0;
+    uint64_t taken = 0;
     std::vector<std::pair<int32_t, int32_t>> selected;
-    selected.reserve((size_t) slots);
+    selected.reserve(auto_size ? ranked.size() : (size_t) slots);
     std::vector<uint8_t> picked(claimed.size(), 0);
     for (const auto& pair : ranked) {
         if (pair.first < 0 || pair.first >= layers || pair.second < 0 || pair.second >= experts) continue;
         const size_t index = (size_t) pair.first * (size_t) experts + (size_t) pair.second;
         if (primary.slot_of(pair.first, pair.second) < 0 && !claimed[index] && !picked[index]) {
+            if (auto_size) {
+                const uint64_t b = lay.native ? (lay.blob_bytes(pair.first) + 255) / 256 * 256 : lay.max_blob;
+                if (taken + b > budget) break;
+                taken += b;
+            }
             selected.push_back(pair);
             picked[index] = 1;
             if ((int) selected.size() >= slots) break;
