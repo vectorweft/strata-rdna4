@@ -27,6 +27,7 @@
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -157,6 +158,7 @@ __global__ void moe_combine_kernel(const float* __restrict__ parts, const float*
 }  // namespace
 
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
+bool shared_expert_native_bf16() { return native_bf16; }
 
 namespace {
 __global__ void scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
@@ -166,12 +168,134 @@ __global__ void scale_rows_kernel(float* __restrict__ out, const float* __restri
 }
 }  // namespace
 
+namespace {
+// ---------------------------------------------------------------- fused Q8_0 shared expert (decode windows)
+// The native path above is nine launches per layer (quantize, gate, up, swiglu, quantize, down, gate gemv,
+// sigmoid, scale), each a few microseconds of launch and ramp for a few MB of work.  For the Q8_0 shared experts
+// of ordinary GGUF quants (Unsloth UD-Q4_K_XL) the same arithmetic runs in two kernels after the input quantize:
+//   sh_gu_q8   gate and up rows (Q8_0 x Q8_1), swiglu, and the Q8_1 requantize of h: one block owns 32
+//              consecutive rows, so it owns whole Q8_1 blocks of h; one extra block computes the shared gate.
+//   sh_down_q8 the down rows (Q8_0 x Q8_1) times the sigmoid gate.
+// Integer dots are exact; the float sums differ from the unfused path's order (rounding-level).
+constexpr int SH_E = 2560, SH_F = 640, SH_EB = SH_E / 32, SH_FB = SH_F / 32, SH_THREADS = 512, SH_WARPS = 16;
+struct Q81 { half2 ds; int8_t qs[32]; };
+
+__device__ __forceinline__ float sh_warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float sh_warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+// one Q8_0 block (34 bytes, 2-byte aligned) against one Q8_1 block: the integer dot
+__device__ __forceinline__ int sh_dot_q8(const uint8_t* wb, const Q81& xb) {
+    const uint16_t* q16 = reinterpret_cast<const uint16_t*>(wb + 2);
+    const int* x32 = reinterpret_cast<const int*>(xb.qs);
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sumi = __dp4a((int) (q16[2 * i] | ((uint32_t) q16[2 * i + 1] << 16)), x32[i], sumi);
+    return sumi;
+}
+__device__ __forceinline__ float sh_h2f(const uint8_t* p) { return __half2float(*reinterpret_cast<const __half*>(p)); }
+
+__global__ void __launch_bounds__(SH_THREADS) sh_gu_q8_kernel(const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wu,
+                                                             const Q81* __restrict__ xq, const float* __restrict__ x,
+                                                             const uint16_t* __restrict__ w_gi, int T,
+                                                             Q81* __restrict__ hq, float* __restrict__ g_out) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (blockIdx.x == SH_FB) {   // the shared gate: sigmoid(w_gi . x), one warp per token
+        if (warp >= T) return;
+        const float* xr = x + (size_t) warp * SH_E;
+        float acc = 0.0f;
+        for (int i = lane; i < SH_E; i += 32) acc = fmaf(__uint_as_float((uint32_t) w_gi[i] << 16), xr[i], acc);
+        acc = sh_warp_sum(acc);
+        if (lane == 0) g_out[warp] = 1.0f / (1.0f + expf(-acc));
+        return;
+    }
+    __shared__ float gs[2][8][32];
+    const int r0 = blockIdx.x * 32;
+    for (int task = warp; task < 64; task += SH_WARPS) {   // task = (gate|up, row)
+        const int kind = task >> 5, rl = task & 31;
+        const uint8_t* w = (kind ? wu : wg) + (size_t) (r0 + rl) * SH_EB * 34;
+        float acc[8];
+#pragma unroll
+        for (int t = 0; t < 8; ++t) acc[t] = 0.0f;
+        for (int kb = lane; kb < SH_EB; kb += 32) {
+            const uint8_t* wb = w + (size_t) kb * 34;
+            const float dw = sh_h2f(wb);
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                if (t >= T) break;
+                const Q81& xb = xq[t * SH_EB + kb];
+                acc[t] += dw * __low2float(xb.ds) * (float) sh_dot_q8(wb, xb);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t >= T) break;
+            const float v = sh_warp_sum(acc[t]);
+            if (lane == 0) gs[kind][t][rl] = v;
+        }
+    }
+    __syncthreads();
+    if (warp >= T) return;   // warp t: token t's 32 h values -> one Q8_1 block, as native_quantize_q8_1 writes it
+    const float gv = gs[0][warp][lane], uv = gs[1][warp][lane];
+    const float h = gv / (1.0f + expf(-gv)) * uv;
+    const float amax = sh_warp_max(fabsf(h)), sum = sh_warp_sum(h);
+    const float d = amax / 127.0f;
+    Q81& out = hq[warp * SH_FB + blockIdx.x];
+    out.qs[lane] = amax == 0.0f ? 0 : (int8_t) roundf(h / d);
+    if (lane == 0) out.ds = make_half2(d, sum);
+}
+
+__global__ void __launch_bounds__(SH_THREADS) sh_down_q8_kernel(const uint8_t* __restrict__ wd, const Q81* __restrict__ hq,
+                                                               const float* __restrict__ g, int T, float* __restrict__ out) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int r = blockIdx.x * SH_WARPS + warp;
+    if (r >= SH_E) return;
+    float acc[8];
+#pragma unroll
+    for (int t = 0; t < 8; ++t) acc[t] = 0.0f;
+    if (lane < SH_FB) {
+        const uint8_t* wb = wd + ((size_t) r * SH_FB + lane) * 34;
+        const float dw = sh_h2f(wb);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            if (t >= T) break;
+            const Q81& hb = hq[t * SH_FB + lane];
+            acc[t] = dw * __low2float(hb.ds) * (float) sh_dot_q8(wb, hb);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        if (t >= T) break;
+        const float v = sh_warp_sum(acc[t]);
+        if (lane == 0) out[(size_t) t * SH_E + r] = v * g[t];
+    }
+}
+}  // namespace
+
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream) {
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
+    static const bool fused = [] { const char* v = std::getenv("STRATA_SHEXP_FUSED"); return v == nullptr || std::atoi(v) != 0; }();
+    if (fused && native_bf16 && n_embd == SH_E && n_ff == SH_F && nw.gate_type == 8 && nw.up_type == 8 && nw.down_type == 8) {
+        // Q8_0 shared expert: quantize, gate/up/swiglu/requantize (+ the gate), down x gate - three launches
+        native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
+        Q81* hq = reinterpret_cast<Q81*>(up);   // n_ff floats per token hold its 20 Q8_1 blocks of h
+        sh_gu_q8_kernel<<<SH_FB + 1, SH_THREADS, 0, cs>>>((const uint8_t*) nw.gate_data, (const uint8_t*) nw.up_data,
+                                                         (const Q81*) nw.q8_1, x, gate_inp_bf16, n_tok, hq, g);
+        sh_down_q8_kernel<<<SH_E / SH_WARPS, SH_THREADS, 0, cs>>>((const uint8_t*) nw.down_data, hq, g, n_tok, out);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi (fused): ") + cudaGetErrorString(e));
+        return;
+    }
     native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
     native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
     native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
