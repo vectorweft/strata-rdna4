@@ -1232,6 +1232,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (static const char* first = std::getenv("STRATA_DUMP_FIRST_LOGITS"); first && windows == 0) {
+        // debug: row 0 of the first window (the prediction after the prompt) in the --dump-logits format
+        std::vector<float> h((size_t) n_vocab_);
+        cudaMemcpy(h.data(), head_logits_, h.size() * 4, cudaMemcpyDeviceToHost);
+        if (std::FILE* f = std::fopen(first, "wb")) {
+            const int32_t hdr[2] = {(int32_t) n_vocab_, 1};
+            std::fwrite(hdr, sizeof hdr, 1, f);
+            std::fwrite(h.data(), 4, h.size(), f);
+            std::fclose(f);
+        }
+    }
     if (static const bool mg = std::getenv("STRATA_VERIFY_MARGIN") != nullptr; mg) {   // debug: each row's top-2 gap
         std::vector<float> h((size_t) T * (size_t) n_vocab_);
         cudaMemcpy(h.data(), head_logits_, h.size() * 4, cudaMemcpyDeviceToHost);

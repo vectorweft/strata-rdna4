@@ -23,6 +23,10 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
 /// the two calls, without reading R back.
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream);
+/// xn[t, c*2560 + d] = R * rs[t*4 + c] * w_norm (gr_norm_rs's rows in FP32, for the MMQ quantizer)
+void gr_xn_rows(const float* R, const float* rs, const float* w_norm, float* xn, int64_t T, void* stream);
+/// out[t, k] = silu(lo[t, k] / hc) in FP32
+void gr_silu_f(const float* lo, float* out, int64_t T, void* stream);
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream);
 /// mixed[t, d] = mean_c xn[t, c, d] * sigmoid(gated[t, c, d]); FP32, BF16 and FP16 (either image may be null).
@@ -69,8 +73,9 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, float freq_base, void* stream);
 /// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
-/// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
-void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream);
+/// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized); with
+/// `gated_in_place` the FP32 gated values are also written back into attn
+void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, bool gated_in_place = false);
 
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.

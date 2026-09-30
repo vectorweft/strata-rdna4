@@ -132,6 +132,21 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
 #pragma unroll
     for (int d = threadIdx.x; d < N; d += 256, ++k) xn16[row * N + d] = bf(v[k] * rs * w[c * N + d]);
 }
+// the FP32 image of gr_norm_rs's rows (the dense MMQ path quantizes it): r * rs * w, the same product
+__global__ void gr_xn_rows_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
+                                  float* __restrict__ xn, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * D) return;
+    const int64_t row = i / N;                       // t * 4 + c
+    const int c = (int) (row % HC);
+    xn[i] = R[i] * rs[row] * w[c * N + (i % N)];
+}
+__global__ void gr_silu_f_kernel(const float* __restrict__ lo, float* __restrict__ out, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float x = lo[i] / (float) HC;
+    out[i] = x / (1.0f + __expf(-x));
+}
 __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restrict__ lo16, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -484,12 +499,14 @@ __global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__
     const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
     q[i] = qf[t * 24 * 512 + h * 512 + d];
 }
-__global__ void gate_attn_kernel(const float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
-                                 int64_t T) {
+__global__ void gate_attn_kernel(float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
+                                 int64_t T, bool in_place) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * 24 * 256) return;
     const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-    o16[i] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
+    const float g = a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d])));
+    o16[i] = hf(g);
+    if (in_place) a[i] = g;   // the FP32 gated rows (the o-projection through MMQ quantizes those)
 }
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
@@ -597,6 +614,14 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
                                                                                       rs, xn16);
     check("gr_write_norm_rs");
 }
+void gr_xn_rows(const float* R, const float* rs, const float* w_norm, float* xn, int64_t T, void* stream) {
+    gr_xn_rows_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, xn, T);
+    check("gr_xn_rows");
+}
+void gr_silu_f(const float* lo, float* out, int64_t T, void* stream) {
+    gr_silu_f_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, out, T * LR);
+    check("gr_silu_f");
+}
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream) {
     gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, T * LR);
     check("gr_silu");
@@ -703,8 +728,9 @@ void split_q(const float* q_full, float* q, int64_t T, void* stream) {
     split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
     check("split_q");
 }
-void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
-    gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T);
+void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, bool gated_in_place) {
+    gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(const_cast<float*>(attn), q_full, out16, T,
+                                                                                  gated_in_place);
     check("gate_attn");
 }
 

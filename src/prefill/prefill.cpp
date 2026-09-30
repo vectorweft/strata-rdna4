@@ -293,6 +293,7 @@ struct Prefill::Impl {
     // the dense Q8_0 projections through MMQ too (STRATA_PREFILL_DENSE_MMQ): their q8_1 rows and {0, T}
     void* Xqd = nullptr;
     int32_t* dense_bounds = nullptr;
+    float *xnf = nullptr, *lof = nullptr;   // the hyper-connection read's FP32 inputs for MMQ (T x 10240, T x 320)
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     std::vector<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
@@ -654,6 +655,8 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.Xqd = o.take<uint8_t>(mmq::q8_bytes((int64_t) T, 12288), ok);   // the widest dense input (attn_output: 6144)
         m.dense_bounds = o.take<int32_t>(2, ok);
+        // (xnf / lof are not allocated: the hyper-connection read borrows the MoE buffers Dm and GU, dead between a
+        // layer's combine and the next MoE product in stream order - see the hc read)
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
@@ -901,6 +904,23 @@ bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y
 bool dense_mmq_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_DENSE_MMQ"); return !(v && v[0] == '0'); }();
     return on && mmq::built();
+}
+// Y[T, rows] = X[T, K] . W^T through MMQ, W given as GGUF blocks of `type`
+bool hc_mmq_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_HC_MMQ"); return !(v && v[0] == '0'); }();
+    return on;
+}
+template <typename M>
+void mmq_dense(M& m, const void* w_blocks, int type, int64_t rows, int64_t K, const float* Xf, float* Y, int64_t T,
+               int64_t ldy) {
+    mmq::quantize(Xf, nullptr, m.Xqd, type, K, K, T, m.cs);
+    mmq::set_bounds(m.dense_bounds, T, m.cs);
+    mmq::Product p;
+    p.w = w_blocks; p.type = type; p.w_rows = rows; p.w_cols = K;
+    p.expert_bytes = mmq::matrix_bytes(type, rows, K); p.n = 1;
+    p.xq = m.Xqd; p.bounds = m.dense_bounds; p.ids = m.ids_identity; p.total_rows = T; p.max_rows = T;
+    p.dst = Y; p.ld_dst = ldy > 0 ? ldy : rows;
+    m.mmq_ctx->run(p, m.cs);
 }
 template <typename M>
 bool native_proj_x(M& m, const core::WeightRef* w, const float* Xf, const uint16_t* Xh, float* Y, int64_t T,
@@ -1326,9 +1346,29 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 if (!wu->data && wu->hc_q8) {
                     wu_b = *wu; wu_b.data = strata::kernels::hc_bf16_from_q8(wu->hc_q8, wu->ne1, wu->ne0, 1, m.cs); wu = &wu_b;
                 }
-                if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)) return false;
-                gr_silu(m.lo, m.lo16, T, m.cs);
-                if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
+                // the FP32 inputs in the MoE buffers (Dm: T x K x 2560 >= T x 10240; GU: T x K x 1280 >= T x 320), both
+                // dead here: this layer's MoE runs after this read, the previous one's combine already ran
+                m.xnf = m.Dm; m.lof = m.GU;
+                const bool hc_mmq = dense_mmq_on() && m.xnf && m.lof && m.Xqd && m.mmq_ctx && m.ids_identity &&
+                                    wd->hc_q8 && wu->hc_q8 && !gr_unfused() && hc_mmq_on();
+                if (hc_mmq) {
+                    // down and up through MMQ from the Q8_0 source (repacked into GGUF blocks in the GEMM scratch)
+                    uint8_t* blk = (uint8_t*) m.gemm.scratch();
+                    const int64_t dbytes = wd->ne1 * (wd->ne0 / 32) * 34, ubytes = wu->ne1 * (wu->ne0 / 32) * 34;
+                    constexpr int64_t kTail = 4096;
+                    if ((dbytes + ubytes + 2 * kTail + 256) / 2 > m.gemm.scratch_elems()) { err = "prefill: hc scratch"; return false; }
+                    uint8_t* bu = blk + (dbytes + kTail + 255) / 256 * 256;
+                    strata::kernels::hc_q8_to_blocks(wd->hc_q8, wd->ne1, wd->ne0, blk, kTail, m.cs);
+                    strata::kernels::hc_q8_to_blocks(wu->hc_q8, wu->ne1, wu->ne0, bu, kTail, m.cs);
+                    gr_xn_rows(m.R, m.grs, (const float*) wn->data, m.xnf, T, m.cs);
+                    mmq_dense(m, blk, 8, wd->ne1, wd->ne0, m.xnf, m.lo, T, 0);
+                    gr_silu_f(m.lo, m.lof, T, m.cs);
+                    mmq_dense(m, bu, 8, wu->ne1, wu->ne0, m.lof, m.gated, T, 0);
+                } else {
+                    if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)) return false;
+                    gr_silu(m.lo, m.lo16, T, m.cs);
+                    if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
+                }
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
                 if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
                 else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
@@ -1548,7 +1588,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                     if (st.kv_q4 || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
-                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
+                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, /*gated_in_place=*/dense_mmq_on());
                     if (!native_proj_x(m, wo, m.attn, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;
                 } else {

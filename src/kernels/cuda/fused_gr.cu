@@ -994,6 +994,34 @@ const uint16_t* hc_bf16_from_q8(const void* planes, int64_t rows, int64_t K, int
     return g_hc_scratch[dev][slot];
 }
 
+namespace {
+__global__ void hc_q8_to_blocks_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, uint8_t* __restrict__ out,
+                                       int64_t n_blocks) {
+    const int64_t b = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    uint8_t* o = out + b * 34;
+    const uint16_t dv = d[b];
+    o[0] = (uint8_t) (dv & 0xff); o[1] = (uint8_t) (dv >> 8);
+    const int8_t* src = q + b * 32;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) o[2 + j] = (uint8_t) src[j];
+}
+__global__ void zero_bytes_kernel(uint8_t* p, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = 0;
+}
+}  // namespace
+
+void hc_q8_to_blocks(const void* planes, int64_t rows, int64_t K, void* out, int64_t tail_zero, void* stream) {
+    const int64_t n = rows * K, nb = n / 32;
+    const auto* q = (const int8_t*) planes;
+    const auto* d = (const uint16_t*) (q + n);
+    const cudaStream_t s = (cudaStream_t) stream;
+    hc_q8_to_blocks_kernel<<<(unsigned) ((nb + 255) / 256), 256, 0, s>>>(q, d, (uint8_t*) out, nb);
+    if (tail_zero > 0)
+        zero_bytes_kernel<<<(unsigned) ((tail_zero + 255) / 256), 256, 0, s>>>((uint8_t*) out + nb * 34, tail_zero);
+}
+
 unsigned fused_gr_barrier_timeouts() {
     unsigned v = 0;
     if (hipMemcpyFromSymbol(&v, HIP_SYMBOL(g_gr_bar_timeouts), sizeof v, 0, hipMemcpyDeviceToHost) != hipSuccess) { cudaGetLastError(); return 0; }

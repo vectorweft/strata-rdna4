@@ -65,6 +65,9 @@ void fused_gr_prepare();
 /// call with that slot on the device), bitwise the values the pack's bf16 copy holds.  hc_bf16_reserve() first,
 /// outside stream capture.
 bool hc_bf16_reserve();
+/// The Q8_0 planes back as GGUF Q8_0 blocks (34 bytes: fp16 d, 32 int8) at `out`, then `tail_zero` zero bytes (the
+/// MMQ kernels read whole K tiles past a row whose K is not a multiple of 256).
+void hc_q8_to_blocks(const void* planes, int64_t rows, int64_t K, void* out, int64_t tail_zero, void* stream);
 const uint16_t* hc_bf16_from_q8(const void* planes, int64_t rows, int64_t K, int slot, void* stream);
 /// Grid barriers of the one-kernel read that timed out on the current device (1000 each + the blocks that had
 /// arrived); 0 unless something is wrong.
