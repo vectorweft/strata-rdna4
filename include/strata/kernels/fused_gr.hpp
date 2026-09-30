@@ -54,8 +54,10 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 /// The same with the implementation chosen: 0 = the reference kernels (one warp per down row over all of K; every
 /// token bitwise fused_gr_read), 1 = split-K without the norm kernel: the down projection over 168 blocks instead of
 /// 41 reads R' * w_norm itself, and the per-stream RMS scale is applied when the up kernel reduces the partials (the
-/// projection is linear and a K slice lies in one stream); outputs equal to rounding (1e-7).  fused_gr_read_multi uses 1 unless
-/// STRATA_GR_SPLITK=0.
+/// projection is linear and a K slice lies in one stream); outputs equal to rounding (1e-7).  2 = variant 1 with
+/// register blocking (a down warp applies each activation chunk it reads to 4 rows, an up lane to 4 rows) and
+/// T-way butterfly reductions: variant 1 is shared-memory bound at T > 1 (R9700, T = 4: 38 -> 24 us, T = 8: 67 -> 30
+/// us); equal to rounding.  fused_gr_read_multi uses 2 unless STRATA_GR_SPLITK=0 or 1.
 void fused_gr_read_multi_variant(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, int variant,
                                  unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 

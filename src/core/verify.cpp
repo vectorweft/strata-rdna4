@@ -1157,6 +1157,18 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (static const bool mg = std::getenv("STRATA_VERIFY_MARGIN") != nullptr; mg) {   // debug: each row's top-2 gap
+        std::vector<float> h((size_t) T * (size_t) n_vocab_);
+        cudaMemcpy(h.data(), head_logits_, h.size() * 4, cudaMemcpyDeviceToHost);
+        for (int t = 0; t < T; ++t) {
+            const float* r = h.data() + (size_t) t * n_vocab_;
+            int a = 0, b = -1;
+            for (int i = 1; i < (int) n_vocab_; ++i)
+                if (r[i] > r[a]) { b = a; a = i; } else if (b < 0 || r[i] > r[b]) b = i;
+            std::fprintf(stderr, "verify margin: pos %lld row %d in %d top %d second %d gap %.5f\n", (long long) pos0 + t, t,
+                         tokens[t], a, b, r[a] - r[b]);
+        }
+    }
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
