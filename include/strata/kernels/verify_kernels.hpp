@@ -121,4 +121,21 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// last `window` cells: ids[q * ids_stride + j] = max(0, n_kv - window) + j and the record's width = the count.
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream);
 
+// ---- tensor parallel (the verify window on two GPUs, see verify.hpp set_tp)
+/// Raise the peer's flag by one (system scope, after this rank's earlier P2P stores).
+void tp_signal(uint32_t* peer_flag, void* stream);
+/// Wait until this rank's flag reaches its next expected count (`expect`, a device counter this kernel advances);
+/// after 5 s it gives up and counts the failure in `err`.
+void tp_wait(const uint32_t* flag, uint32_t* expect, uint32_t* err, void* stream);
+/// n floats (n % 4 == 0) into the peer's buffer / acc += recv.
+void tp_push(const float* src, float* peer_dst, long long n, void* stream, uint32_t* peer_flag = nullptr);
+void tp_add(float* acc, const float* recv, long long n, void* stream);
+/// resident_plan for the entries this cache holds only (no skip flag: the others are another rank's).
+void resident_plan_subset(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                          const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                          long long capx, void* stream);
+
+/// Q8_0 blocks (34 bytes) -> Q4_0 blocks (18 bytes), llama.cpp's quantize_row_q4_0_ref arithmetic (MTP draft head).
+void q8_0_to_q4_0(const uint8_t* q8, uint8_t* q4, long long nblocks, void* stream);
+
 }  // namespace strata::kernels

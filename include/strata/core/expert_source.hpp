@@ -150,6 +150,9 @@ struct ExpertDispatch {
     ExpertSource* src = nullptr;
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
+    /// tensor parallel: the verify window's rank 1 computes the experts the remote tiers hold in its own graph, so
+    /// the multi-token pool leaves their rows zero (no begin / finish round trip)
+    bool tp_skip_remote = false;
     int64_t n_expert = strata::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.

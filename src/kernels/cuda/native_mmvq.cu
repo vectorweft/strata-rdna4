@@ -1001,7 +1001,8 @@ bool g_multi_exact = [] { const char* v = std::getenv("STRATA_MMVQ_UPSTREAM"); r
 template<typename F, int NCOLS, int NW, int ROWS>
 __device__ __forceinline__ void mmvq_multi_rows(const typename F::Block* __restrict__ w,
                                                 const Q81Block* __restrict__ x,
-                                                float* __restrict__ y, int n_in, int n_out, int row0) {
+                                                float* __restrict__ y, int n_in, int n_out, int row0,
+                                                float* __restrict__ y_peer = nullptr) {
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int blocks_per_row = n_in / F::DIV;
@@ -1037,7 +1038,10 @@ __device__ __forceinline__ void mmvq_multi_rows(const typename F::Block* __restr
 #pragma unroll
             for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
             tmp[j][i] = warp_sum(tmp[j][i]);
-            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+            if (threadIdx.x == i && row0 + i < n_out) {
+                y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+                if (y_peer) y_peer[std::size_t(j) * n_out + row0 + i] = tmp[j][i];   // tensor parallel: the peer's copy
+            }
         }
     }
 }
@@ -1556,4 +1560,108 @@ void gdn_front(const void* w_qkv, const void* w_z, const void* x_q8_1, float* y_
     launch_check();
 }
 
+namespace {
+// tensor parallel: the LAST block of a TP kernel raises the peer's flag (each block fences its own P2P rows at
+// system scope first), which saves the separate signal kernel of an exchange
+__device__ unsigned g_tp_done;
+__device__ __forceinline__ void tp_block_done(uint32_t* peer_flag) {
+    if (peer_flag == nullptr || threadIdx.x != 0 || threadIdx.y != 0) return;
+    __threadfence();   // agent scope per block (a system fence in every block cost ~40 ms a window); the last
+                       // block's system fence below then publishes all of them before the flag
+    const unsigned done = atomicAdd(&g_tp_done, 1u);
+    if (done == gridDim.x - 1) {
+        __threadfence_system();
+        __hip_atomic_store(&g_tp_done, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_fetch_add(peer_flag, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+// ---- tensor parallel (verify window): a rank computes rows [row0, row0 + n_rows) of an n_out-row Q8_0 matrix,
+// each row exactly as native_mmvq's exact path computes it (one block per row), into y AND the peer GPU's y_peer
+// (the same full [ncols][n_out] layout on both), so the halves of the two ranks form the whole output on each.
+template<int NCOLS>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void tp_q8_0_rows_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ xq,
+                                    float* __restrict__ y, float* __restrict__ y_peer, int n_in, int n_out, int row0,
+                                    uint32_t* peer_flag) {
+    mmvq_multi_rows<Q80T, NCOLS, WARPS, 1>(w, xq, y, n_in, n_out, row0 + int(blockIdx.x), y_peer);
+    tp_block_done(peer_flag);
+}
+// the GDN front of one rank: qkv rows [q0, q0 + nq), z rows [z0, z0 + nz) (to both GPUs), then ALL alpha / beta rows
+// (replicated: 0.5 MB, cheaper than an exchange) exactly as gdn_front_kernel computes each of them
+template<int NCOLS>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void tp_gdn_front_kernel(const Q80Block* __restrict__ w_qkv, const Q80Block* __restrict__ w_z,
+                                    const Q81Block* __restrict__ xq, float* __restrict__ y_qkv, float* __restrict__ y_z,
+                                    float* __restrict__ p_qkv, float* __restrict__ p_z, int n_in, int n_qkv, int n_z,
+                                    int q0, int nq, int z0, int nz, const float* __restrict__ x,
+                                    const uint16_t* __restrict__ wa, const uint16_t* __restrict__ wb,
+                                    const float* __restrict__ dt, const float* __restrict__ ssm_a,
+                                    float* __restrict__ gate, float* __restrict__ beta, int h_v, uint32_t* peer_flag) {
+    const int b = int(blockIdx.x);
+    if (b < nq) {
+        mmvq_multi_rows<Q80T, NCOLS, WARPS, 1>(w_qkv, xq, y_qkv, n_in, n_qkv, q0 + b, p_qkv);
+    } else if (b < nq + nz) {
+        mmvq_multi_rows<Q80T, NCOLS, WARPS, 1>(w_z, xq, y_z, n_in, n_z, z0 + b - nq, p_z);
+    } else {
+        gdn_ab_row(x, wa, wb, dt, ssm_a, gate, beta, n_in, h_v, NCOLS, (b - nq - nz) * WARPS + int(threadIdx.y),
+                   int(threadIdx.x));
+    }
+    tp_block_done(peer_flag);
+}
+}  // namespace
+
+void tp_q8_0_rows(const void* w, const void* x_q8_1, float* y, float* y_peer, int n_in, int n_out, int row0, int n_rows,
+                  int ncols, void* stream, uint32_t* peer_flag) {
+    validate_shape(n_in, ncols, 32);
+    validate_stream(stream);
+    if (n_in / 32 < Q80T::BPI) throw std::invalid_argument("tp_q8_0_rows: the input is too short for the exact path");
+    const auto s = static_cast<cudaStream_t>(stream);
+    const auto* wq = static_cast<const Q80Block*>(w);
+    const auto* xq = static_cast<const Q81Block*>(x_q8_1);
+    const dim3 threads(WARP, WARPS);
+#define STRATA_TP_ROWS(NC) tp_q8_0_rows_kernel<NC><<<unsigned(n_rows), threads, 0, s>>>(wq, xq, y, y_peer, n_in, n_out, row0, peer_flag)
+    switch (ncols) {
+        case 1: STRATA_TP_ROWS(1); break;
+        case 2: STRATA_TP_ROWS(2); break;
+        case 3: STRATA_TP_ROWS(3); break;
+        case 4: STRATA_TP_ROWS(4); break;
+        case 5: STRATA_TP_ROWS(5); break;
+        case 6: STRATA_TP_ROWS(6); break;
+        case 7: STRATA_TP_ROWS(7); break;
+        case 8: STRATA_TP_ROWS(8); break;
+    }
+#undef STRATA_TP_ROWS
+    launch_check();
+}
+
+void tp_gdn_front(const void* w_qkv, const void* w_z, const void* x_q8_1, float* y_qkv, float* y_z, float* p_qkv,
+                  float* p_z, int n_in, int n_qkv, int n_z, int q0, int nq, int z0, int nz, const float* x,
+                  const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a, float* gate,
+                  float* beta, int h_v, int ncols, void* stream, uint32_t* peer_flag) {
+    validate_shape(n_in, ncols, 32);
+    validate_stream(stream);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const unsigned blocks = unsigned(nq + nz + (2 * h_v + WARPS - 1) / WARPS);
+    const dim3 threads(WARP, WARPS);
+    const auto* wq = static_cast<const Q80Block*>(w_qkv);
+    const auto* wz = static_cast<const Q80Block*>(w_z);
+    const auto* xq = static_cast<const Q81Block*>(x_q8_1);
+#define STRATA_TP_FRONT(NC) tp_gdn_front_kernel<NC><<<blocks, threads, 0, s>>>(wq, wz, xq, y_qkv, y_z, p_qkv, p_z, n_in, \
+                                                                             n_qkv, n_z, q0, nq, z0, nz, x, w_alpha, \
+                                                                             w_beta, dt, ssm_a, gate, beta, h_v, peer_flag)
+    switch (ncols) {
+        case 1: STRATA_TP_FRONT(1); break;
+        case 2: STRATA_TP_FRONT(2); break;
+        case 3: STRATA_TP_FRONT(3); break;
+        case 4: STRATA_TP_FRONT(4); break;
+        case 5: STRATA_TP_FRONT(5); break;
+        case 6: STRATA_TP_FRONT(6); break;
+        case 7: STRATA_TP_FRONT(7); break;
+        case 8: STRATA_TP_FRONT(8); break;
+    }
+#undef STRATA_TP_FRONT
+    launch_check();
+}
+
 } // namespace strata::kernels
+

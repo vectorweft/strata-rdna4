@@ -1099,7 +1099,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0 : -1;
         }
     }
-    if (d.remote_count > 0) {
+    if (d.remote_count > 0 && d.tp_skip_remote) {   // tensor parallel: rank 1 computes these in its graph
+        for (int64_t i = 0; i < n; ++i)
+            if (kind[i] < 0)
+                for (int r = 0; r < d.remote_count; ++r)
+                    if (d.remote[r]->holds(d.layers, ids[i])) { kind[i] = 2; break; }
+    } else if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r) {
             if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
@@ -1163,7 +1168,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("run", njobs);
     if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
     else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
-    if (d.remote_count > 0) {
+    if (d.remote_count > 0 && !d.tp_skip_remote) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
             if (!d.remote[r]->finish(out, remote_error)) {

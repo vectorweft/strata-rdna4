@@ -340,6 +340,9 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    /// --serve: TENSOR PARALLEL decode on CUDA0 + the --expert-cache-device1 GPU (replicated state, split projections;
+    /// see Verifier::set_tp).  The prompt path is unchanged (CUDA0, the helper cache on CUDA1).
+    bool tensor_parallel = false;
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -1132,6 +1135,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--split-device") o.split_device = next("--split-device");
+        else if (a == "--tensor-parallel") o.tensor_parallel = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
@@ -1245,6 +1249,12 @@ int main(int argc, char** argv) {
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  Across
     // GPUs, not yet: KV streaming, images, control vectors, the helper caches (--expert-cache-remote), and lending
     // cache slots to the prompt path (each stage's prompt path has its own buffers).
+    if (o.tensor_parallel && (!o.serve || !o.layer_split.empty() || o.expert_cache_remote[0] <= 0 ||
+                              o.native_preset.empty() || o.spec_split)) {
+        std::fprintf(stderr, "strata serve: --tensor-parallel needs --serve, --native, --expert-cache-device1 (its GPU is "
+                             "rank 1) and no --layer-split / --spec-split\n");
+        return 2;
+    }
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
@@ -2278,6 +2288,90 @@ int main(int argc, char** argv) {
                      last ? " and the head" : "", (double) fb / 1073741824.0);
     }
 
+    // ---- tensor parallel: rank 1 on the helper GPU - the whole model's dense weights and a session replica, made
+    // before the helper cache sizes itself to the rest of that GPU (Verifier::set_tp)
+    std::unique_ptr<GpuStage> tp_st;
+    void* tp_sbuf = nullptr;
+    uint64_t tp_sbytes = 0;
+    if (o.tensor_parallel) {
+        tp_st = std::make_unique<GpuStage>();
+        GpuStage& st = *tp_st;
+        st.dev = remote_dev[0];
+        st.lb = 0;
+        st.le = g.n_layers;
+        double free_gib = 0;
+        if (!strata::core::RemoteExperts::preflight(st.dev, free_gib, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        const strata::core::OnDevice on(st.dev);
+        void* arena_s = nullptr;
+        if (cudaMalloc(&arena_s, pool_bytes) != cudaSuccess ||
+            !st.wt.load(o.pack, arena_s, pool_bytes, err, skip_all.empty() ? nullptr : &skip_all) ||
+            !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
+            std::fprintf(stderr, "strata generate: tensor parallel, CUDA%d weights: %s\n", st.dev,
+                         err.empty() ? "the weight arena does not fit" : err.c_str());
+            return 1;
+        }
+        tp_sbytes = strata::core::session_bytes(g, o.max_context, K, 0, -1);
+        if (cudaMalloc(&tp_sbuf, tp_sbytes) != cudaSuccess ||
+            strata::core::session_init(g, o.max_context, K, tp_sbuf, st.ss, 0, -1) == 0) {
+            std::fprintf(stderr, "strata generate: tensor parallel, CUDA%d: the session replica failed\n", st.dev);
+            return 1;
+        }
+        if (!o.ple_gguf.empty()) {   // the PLE block runs on both ranks: its weights and scratch on this GPU
+            const strata::core::WeightRef* wk = st.wt.find("blk.1.ple_key.weight");
+            const strata::core::WeightRef* wv = st.wt.find("blk.1.ple_value.weight");
+            const strata::core::WeightRef* wnk = st.wt.find("blk.1.ple_norm_key.weight");
+            const strata::core::WeightRef* wnq = st.wt.find("blk.1.ple_norm_query.weight");
+            const strata::core::WeightRef* wnc = st.wt.find("blk.1.ple_norm_conv.weight");
+            const strata::core::WeightRef* wc = st.wt.find("blk.1.ple_conv1d.weight");
+            if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
+                std::fprintf(stderr, "strata generate: tensor parallel: the PLE tensors are missing on CUDA%d\n", st.dev);
+                return 1;
+            }
+            strata::core::PleRun& pr = st.ss.ple;
+            pr = ss.ple;   // the host side (table, constants, embeddings) is shared; the device side is this GPU's
+            pr.w = {};
+            if (!wk->quantized()) pr.w.key_bf16 = (const uint16_t*) wk->data;
+            else if (wk->data != nullptr) {
+                pr.w.key_codes = (const uint8_t*) wk->data;
+                pr.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
+            }
+            if (o.native_ple_key && wk->quantized()) {
+                pr.w.key_native_data = wk->native_data;
+                pr.w.key_native_type = wk->native_type;
+                pr.w.key_native_q8_1 = wk->native_q8_1;
+            }
+            pr.w.value_bf16 = (const uint16_t*) wv->data;
+            pr.w.norm_key = (const float*) wnk->data;
+            pr.w.norm_query = (const float*) wnq->data;
+            pr.w.norm_conv = (const float*) wnc->data;
+            pr.w.conv1d_f16 = (const uint16_t*) wc->data;
+            pr.token = &st.ss.ple_token;
+            pr.prev = st.ss.ple_prev;
+            float* emb_d = nullptr;
+            float* scr_d = nullptr;
+            if (cudaMalloc((void**) &emb_d, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
+                cudaMalloc((void**) &scr_d, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: tensor parallel: the PLE buffers failed on CUDA%d\n", st.dev);
+                return 1;
+            }
+            pr.emb_dev = emb_d;
+            pr.scratch = scr_d;
+            pr.hist = st.ss.ple_hist;
+        }
+        if (cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: tensor parallel, CUDA%d: its stream failed\n", st.dev);
+            return 1;
+        }
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        std::fprintf(stderr, "strata generate: tensor parallel: CUDA%d holds the dense weights and a %.2f GiB session "
+                             "replica; %.2f GiB free for its expert cache\n", st.dev, (double) tp_sbytes / 1073741824.0,
+                     (double) fb / 1073741824.0);
+    }
+
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
@@ -2420,7 +2514,7 @@ int main(int argc, char** argv) {
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
-                                     ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
+                                     ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab, native_head.type()) : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
@@ -2449,6 +2543,32 @@ int main(int argc, char** argv) {
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
+    if (o.tensor_parallel && !profile.empty() && o.expert_cache > 0) {
+        // TENSOR PARALLEL: both GPUs compute their own experts inside the window, so the hot ones are dealt out
+        // between them (CUDA0 takes rank i when floor((i+1)*share) > floor(i*share), share = STRATA_TP_SHARE, 0.5 by
+        // default) instead of CUDA0 taking the hottest block - which left CUDA1 waiting for CUDA0's hits every layer.
+        // The helper cache takes the rest in rank order, as before.
+        static const double share = [] {
+            const char* v = std::getenv("STRATA_TP_SHARE");
+            const double x = v ? std::atof(v) : 0.5;
+            return x > 0.05 && x <= 1.0 ? x : 0.5;
+        }();
+        // (before the slots are sized: a native pack's slots take the sizes of the profile's first pairs, in order)
+        const int64_t s0 = (int64_t) ((double) profile.size() * share) + 1;
+        std::vector<std::pair<int32_t, int32_t>> mine, rest;
+        mine.reserve((size_t) s0);
+        rest.reserve(profile.size());
+        for (size_t i = 0; i < profile.size(); ++i) {
+            // (over the WHOLE ranking: the sized slots below may hold more pairs than `s0`, and those must be dealt
+            // out too, not taken from the head of the rest - the hottest of CUDA1's share)
+            const bool take = (int64_t) std::floor((double) (i + 1) * share) > (int64_t) std::floor((double) i * share);
+            (take ? mine : rest).push_back(profile[i]);
+        }
+        mine.insert(mine.end(), rest.begin(), rest.end());
+        profile.swap(mine);
+        std::fprintf(stderr, "strata generate: tensor parallel: CUDA0's cache takes %.0f%% of the hot experts\n",
+                     100.0 * share);
+    }
     std::vector<int64_t> sized_slots;
     if (native_pack && o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
@@ -3793,6 +3913,69 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+        // ---- tensor parallel: rank 1 on the helper GPU, planning and computing the experts its cache holds
+        if (tp_st) {
+            GpuStage& st = *tp_st;
+            const strata::core::ExpertCache& rc = remote_experts[0].cache();
+            {
+                const strata::core::OnDevice on(st.dev);
+                std::vector<int32_t> rres((size_t) g.n_layers * (size_t) g.n_expert, -1);
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e) rres[(size_t) (l * g.n_expert + e)] = rc.slot_of(l, e);
+                if (cudaMalloc((void**) &st.d_res, rres.size() * sizeof(int32_t)) != cudaSuccess ||
+                    cudaMemcpy(st.d_res, rres.data(), rres.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: tensor parallel: the CUDA%d residency table failed\n", st.dev);
+                    return 1;
+                }
+                strata::core::VerifyHits vh1;
+                vh1.d_res = st.d_res;
+                vh1.cache_base = rc.device_slot(0);
+                vh1.blob = thits.blob;
+                vh1.slot_off = rc.slot_offsets();
+                vh1.n_slots = rc.slots();
+                if (!st.ver.init(st.wt, g, st.ss, vh1, nullptr, o.spec, err)) {
+                    std::fprintf(stderr, "strata serve: tensor parallel, CUDA%d: %s\n", st.dev, err.c_str());
+                    return 1;
+                }
+            }
+            if (!ver.set_tp(0, &st.ver, err) || !st.ver.set_tp(1, &ver, err)) {
+                std::fprintf(stderr, "strata serve: tensor parallel: %s\n", err.c_str());
+                return 1;
+            }
+            drive.d.tp_skip_remote = true;
+            std::fprintf(stderr, "strata serve: tensor parallel decode: CUDA0 + CUDA%d (split projections, %lld experts "
+                                 "planned on CUDA%d)\n", st.dev, (long long) rc.resident(), st.dev);
+        }
+        // the replica follows CUDA0's session whenever something other than a window wrote it (the batched prompt
+        // path, a restored checkpoint, a reset): one peer copy before the next window
+        bool tp_dirty = true;
+        auto tp_sync = [&](std::string& e) -> bool {
+            if (!tp_st || !tp_dirty) return true;
+            const auto t0s = Clock::now();
+            // (cudaMemcpyPeer is asynchronous to the host, and rank 1's non-blocking stream does not wait for it:
+            // both devices are synchronized around the copy)
+            bool ok_c = cudaDeviceSynchronize() == cudaSuccess &&
+                        cudaMemcpyPeer(tp_sbuf, tp_st->dev, sbuf, 0, (size_t) tp_sbytes) == cudaSuccess &&
+                        cudaDeviceSynchronize() == cudaSuccess;
+            {
+                const strata::core::OnDevice on1(tp_st->dev);
+                ok_c = ok_c && cudaDeviceSynchronize() == cudaSuccess;
+            }
+            if (!ok_c) {
+                e = "tensor parallel: copying the session to the replica failed";
+                return false;
+            }
+            tp_st->ss.ple_prev[0] = ss.ple_prev[0];
+            tp_st->ss.ple_prev[1] = ss.ple_prev[1];
+            tp_st->ss.ple_token = ss.ple_token;
+            tp_dirty = false;
+            static const bool trace_sync = std::getenv("STRATA_TP_TRACE") != nullptr;
+            if (trace_sync)
+                std::fprintf(stderr, "strata serve: tensor parallel: session replica synced (%.2f GiB, %.1f ms)\n",
+                             (double) tp_sbytes / 1073741824.0,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0s).count());
+            return true;
+        };
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             stage_ver(st).set_pcie_share(split_drive.pcie_num[st] > 0);
@@ -4582,6 +4765,7 @@ int main(int argc, char** argv) {
                 part_at.clear();
                 std::fill(part_next.begin(), part_next.end(), pp_next_check);
             }
+            tp_dirty = true;   // (tensor parallel: a reset / restore / the batched path may write CUDA0's session)
             std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
             strata::core::progress_at("reading the prompt, from token", read_from);
             std::fflush(stdout);
@@ -4603,6 +4787,7 @@ int main(int argc, char** argv) {
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
+                if (!tp_sync(e)) return false;
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
                     strata::core::Verifier& v;
@@ -4769,6 +4954,7 @@ int main(int argc, char** argv) {
                 }
                 const auto tsp = Clock::now();
                 const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
+                if (!win) tp_dirty = true;
                 if (trace) {
                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
                                  win ? "windows" : "batched",
@@ -4802,6 +4988,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             tr("prompt done (slots refilled)");
+            if (!tp_sync(err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
@@ -4959,6 +5149,8 @@ int main(int argc, char** argv) {
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
+                const std::string pr1 = ver.tp_peer_profile_report();
+                if (!pr1.empty()) std::fprintf(stderr, "strata decode GPU stages, tensor parallel rank 1 (ms/window):%s\n", pr1.c_str());
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from

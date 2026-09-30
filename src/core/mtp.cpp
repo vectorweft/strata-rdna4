@@ -304,14 +304,21 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     return true;
 }
 
-uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
+uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, int head_type) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
     if (dhead_ == nullptr) {
         if (FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fclose(f);
-            if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+            if (size >= 4 && size % 4 == 0) {
+                const char* hv = std::getenv("STRATA_MTP_HEAD");
+                const bool to_q4 = head_type == 8 && !(hv && std::string(hv) == "q8_0") && head_row_bytes % 34 == 0;
+                const uint64_t rows = (uint64_t) (size / 4);
+                bytes += (uint64_t) size + (to_q4 ? rows * (head_row_bytes / 34) * 18 +
+                                                        std::min<uint64_t>(rows * head_row_bytes, kDraftHeadChunkBytes)
+                                                  : rows * head_row_bytes);
+            }
         }
     }
     // coupled draft sampling (STRATA_SPEC_COUPLED=1 only): an upper bound - the id -> subset map, the penalty ring,
@@ -395,88 +402,46 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
+            // A Q8_0 head is re-quantized to Q4_0 for the drafts (STRATA_MTP_HEAD=q8_0 keeps it): every draft step
+            // reads the whole draft head (289 MB at Q8_0 over 106K tokens, most of a step's bytes), while the
+            // verify window, which decides the text, keeps the full-precision head.  On the device, a chunk of rows
+            // at a time: the Q8_0 rows never exist whole (a 248K-token subset is 644 MiB at Q8_0, 341 at Q4_0), and
+            // no pageable host copy (in --serve, with tens of GiB pinned, its staging allocation failed).
+            const char* hv = std::getenv("STRATA_MTP_HEAD");
+            const bool to_q4 = head->type() == 8 && !(hv && std::string(hv) == "q8_0") && row_bytes % 34 == 0;
+            if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess) {
                 err = "mtp: the draft head does not fit";
                 return false;
             }
             cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
-            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
-            cudaDeviceSynchronize();
-            dhead_type_ = head->type();
-            int64_t used = n_dvocab_ * row_bytes;
-            // A Q8_0 head is re-quantized to Q4_0 for the drafts (STRATA_MTP_HEAD=q8_0 keeps it): every draft step
-            // reads the whole draft head (289 MB at Q8_0 over 106K tokens, most of a step's bytes), while the
-            // verify window, which decides the text, keeps the full-precision head.
-            const char* hv = std::getenv("STRATA_MTP_HEAD");
-            if (dhead_type_ == 8 && !(hv && std::string(hv) == "q8_0") && head->row_bytes() % 34 == 0) {
-                const int64_t nb = row_bytes / 34;                 // Q8_0 blocks per row
-                std::vector<uint8_t> q8((size_t) used), q4((size_t) (n_dvocab_ * nb * 18));
-                uint8_t* d4 = nullptr;
-                // the Q8_0 rows leave the device BEFORE the Q4_0 copy is allocated: holding both at once (Q8 + Q4)
-                // is more than bind_bytes reserved, and with the whole vocabulary the allocation failed and the
-                // drafts silently kept the 644 MiB native rows
-                bool on_host = cudaMemcpy(q8.data(), dhead_, q8.size(), cudaMemcpyDeviceToHost) == cudaSuccess;
-                if (on_host) { cudaFree(dhead_); dhead_ = nullptr; }
-                if (on_host && cudaMalloc((void**) &d4, q4.size()) != cudaSuccess) {
-                    cudaGetLastError();
-                    d4 = nullptr;   // put the Q8_0 rows back
-                    if (cudaMalloc((void**) &dhead_, q8.size()) != cudaSuccess ||
-                        cudaMemcpy(dhead_, q8.data(), q8.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
-                        err = "mtp: the draft head does not fit";
-                        return false;
-                    }
+            int64_t used = 0;
+            if (to_q4) {
+                const int64_t nb = row_bytes / 34, q4_row = nb * 18;
+                const int64_t chunk = std::min<int64_t>(n_dvocab_, std::max<int64_t>(1, kDraftHeadChunkBytes / row_bytes));
+                uint8_t* tmp = nullptr;
+                if (cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * q4_row)) != cudaSuccess ||
+                    cudaMalloc((void**) &tmp, (size_t) (chunk * row_bytes)) != cudaSuccess) {
+                    err = "mtp: the draft head does not fit";
+                    return false;
                 }
-                if (on_host && d4 != nullptr) {
-                    auto h2f = [](uint16_t h) {
-                        const uint32_t sgn = (uint32_t) (h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
-                        uint32_t u;
-                        if (e == 0) {
-                            if (m == 0) u = sgn;
-                            else { float f = (float) m * (1.0f / 16777216.0f); std::memcpy(&u, &f, 4); u |= sgn; }
-                        } else if (e == 31) u = sgn | 0x7f800000u | (m << 13);
-                        else u = sgn | ((e + 112) << 23) | (m << 13);
-                        float f; std::memcpy(&f, &u, 4); return f;
-                    };
-                    auto f2h = [](float f) {   // round to nearest even, normal range (|d| of a head block)
-                        uint32_t u; std::memcpy(&u, &f, 4);
-                        const uint32_t sgn = (u >> 16) & 0x8000;
-                        const int32_t e = (int32_t) ((u >> 23) & 0xff) - 127 + 15;
-                        if (e <= 0) return (uint16_t) sgn;
-                        if (e >= 31) return (uint16_t) (sgn | 0x7c00);
-                        uint32_t m = u & 0x7fffff, r = m >> 13, rem = m & 0x1fff;
-                        uint32_t h = sgn | ((uint32_t) e << 10) | r;
-                        if (rem > 0x1000 || (rem == 0x1000 && (r & 1))) ++h;
-                        return (uint16_t) h;
-                    };
-                    for (int64_t b = 0; b < n_dvocab_ * nb; ++b) {       // llama.cpp's quantize_row_q4_0_ref
-                        const uint8_t* src = q8.data() + (size_t) b * 34;
-                        uint8_t* dst = q4.data() + (size_t) b * 18;
-                        uint16_t dh; std::memcpy(&dh, src, 2);
-                        const float d8 = h2f(dh);
-                        float x[32], amax = 0.0f, mx = 0.0f;
-                        for (int j = 0; j < 32; ++j) {
-                            x[j] = d8 * (float) (int8_t) src[2 + j];
-                            if (amax < std::fabs(x[j])) { amax = std::fabs(x[j]); mx = x[j]; }
-                        }
-                        const float d = mx / -8.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
-                        const uint16_t d4h = f2h(d);
-                        std::memcpy(dst, &d4h, 2);
-                        for (int j = 0; j < 16; ++j) {
-                            const int a = std::min(15, (int) (int8_t) (x[j] * id + 8.5f));
-                            const int c = std::min(15, (int) (int8_t) (x[16 + j] * id + 8.5f));
-                            dst[2 + j] = (uint8_t) (a | (c << 4));
-                        }
-                    }
-                    if (cudaMemcpy(d4, q4.data(), q4.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
-                        err = "mtp: uploading the Q4_0 draft head failed";
-                        return false;
-                    }
-                    dhead_ = d4;
-                    dhead_type_ = 2;
-                    used = (int64_t) q4.size();
+                for (int64_t r0 = 0; r0 < n_dvocab_; r0 += chunk) {
+                    const int64_t nr = std::min<int64_t>(chunk, n_dvocab_ - r0);
+                    strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_ + r0, nr, tmp, nullptr);
+                    strata::kernels::q8_0_to_q4_0(tmp, (uint8_t*) dhead_ + (size_t) (r0 * q4_row), nr * nb, nullptr);
                 }
-                cudaGetLastError();
+                if (cudaDeviceSynchronize() != cudaSuccess) { err = "mtp: re-quantizing the draft head failed"; return false; }
+                cudaFree(tmp);
+                dhead_type_ = 2;
+                used = n_dvocab_ * q4_row;
+            } else {
+                if (cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
+                    err = "mtp: the draft head does not fit";
+                    return false;
+                }
+                strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+                cudaDeviceSynchronize();
+                dhead_type_ = head->type();
+                used = n_dvocab_ * row_bytes;
             }
             vram_ += (uint64_t) used + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB, %s)\n", (long long) n_dvocab_,

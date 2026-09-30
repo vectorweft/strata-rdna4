@@ -287,6 +287,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
         hist_snap_ = b.take<float>(T * HS);
+        tp_flag_ = b.take<uint32_t>(16); tp_expect_ = b.take<uint32_t>(16); tp_err_ = b.take<uint32_t>(16);
+        tp_recv_ = b.take<float>(T * N);
     };
     Bump count;
     carve(count);
@@ -295,6 +297,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     cudaMemset(arena_, 0, count.used);
+    arena_bytes_ = count.used;
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
@@ -321,6 +324,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
         device_plan_ = v != nullptr && std::atoi(v) != 0;
     }
+    if (!device_plan_ && hits.slot_off != nullptr && hits.n_slots > 0) {   // (tensor parallel rank 1's subset plan)
+        if (cudaMalloc((void**) &slot_off_d_, (size_t) hits.n_slots * sizeof(unsigned long long)) != cudaSuccess ||
+            cudaMemcpy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "verify: the slot offsets do not fit";
+            return false;
+        }
+    }
     if (device_plan_) {
         bool ok2 = cudaMalloc((void**) &skip_, 64) == cudaSuccess && cudaMemset(skip_, 0, 64) == cudaSuccess;
         if (ok2 && hits.slot_off != nullptr && hits.n_slots > 0) {
@@ -333,6 +344,36 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     DebugPle::get().buf((size_t) (g.hc * g.n_embd));   // before any capture
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
+    return true;
+}
+
+bool Verifier::set_tp(int rank, Verifier* peer, std::string& err) {
+    if ((rank != 0 && rank != 1) || peer == nullptr || peer == this || peer->arena_bytes_ != arena_bytes_ ||
+        peer->max_t_ != max_t_ || arena_ == nullptr) {
+        err = "verify: tensor parallel needs two initialized verifiers of the same shape";
+        return false;
+    }
+    if (peer->device_ == device_) { err = "verify: tensor parallel needs two GPUs"; return false; }
+    int can = 0;
+    cudaDeviceCanAccessPeer(&can, device_, peer->device_);
+    if (!can) { err = "verify: the GPUs cannot reach each other (P2P)"; return false; }
+    {
+        const OnDevice on(device_);
+        const cudaError_t e = cudaDeviceEnablePeerAccess(peer->device_, 0);
+#if defined(STRATA_USE_HIP)
+        const bool already = e == hipErrorPeerAccessAlreadyEnabled;
+#else
+        const bool already = e == cudaErrorPeerAccessAlreadyEnabled;
+#endif
+        if (e != cudaSuccess && !already) { err = "verify: enabling P2P failed"; return false; }
+        cudaGetLastError();
+        for (auto& ex : exec_)   // windows captured before are the single-GPU ones
+            if (ex) { cudaGraphExecDestroy(ex); ex = nullptr; }
+    }
+    tp_rank_ = rank;
+    tp_peer_ = peer;   // (rank 0 drives rank 1 from run / commit; rank 1 only uses it for the P2P addresses)
+    split_ = false;
+    if (rank == 1) pcie_share_ = false;
     return true;
 }
 
@@ -364,7 +405,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
-    const int G = (split_ && T >= 2) ? 2 : 1;
+    const bool tp = tp_rank_ >= 0;
+    const int G = (split_ && T >= 2 && !tp) ? 2 : 1;
+    // tensor parallel: raise the peer's flag (after this rank's P2P rows), then wait for the peer's
+    // STRATA_TP_NOSYNC=1 (timing experiment only, WRONG results): no exchange at all
+    static const bool tp_nosync = std::getenv("STRATA_TP_NOSYNC") != nullptr;
+    // STRATA_TP_FUSED_SIGNAL=0: a separate signal kernel (the producer kernels raise the peer's flag by default)
+    static const bool tp_fused_sig = [] { const char* v = std::getenv("STRATA_TP_FUSED_SIGNAL"); return !(v && v[0] == '0'); }();
+    uint32_t* const tp_sig = (tp && tp_fused_sig && !tp_nosync) ? peer_of(tp_flag_) : nullptr;
+    auto tp_exchange = [&]() {
+        if (tp_nosync) return;
+        if (!tp_fused_sig) tp_signal(peer_of(tp_flag_), cs);
+        tp_wait(tp_flag_, tp_expect_, tp_err_, cs);
+    };
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
@@ -504,7 +557,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                if (gdn_front_supported(wqkv->native_type, wg->native_type, (int) N)) {
+                if (tp) {
+                    // tensor parallel: this rank's half of the qkv and z rows, into both GPUs; alpha / beta on both
+                    if (!gdn_front_supported(wqkv->native_type, wg->native_type, (int) N)) {
+                        err = "verify: tensor parallel needs the Q8_0 GDN front";
+                        return false;
+                    }
+                    const int hq = (int) (C / 2), hz = (int) (ZV / 2);
+                    tp_gdn_front(wqkv->native_data, wg->native_data, xq_, qkv + (size_t) tb * C, z_ + (size_t) tb * ZV,
+                                 peer_of(qkv + (size_t) tb * C), peer_of(z_ + (size_t) tb * ZV), (int) N, (int) C, (int) ZV,
+                                 tp_rank_ * hq, hq, tp_rank_ * hz, hz, xm, (const uint16_t*) wa->data,
+                                 (const uint16_t*) wb->data, (const float*) wdt->data, (const float*) wsa->data,
+                                 gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) HV, n, cs, tp_sig);
+                    tp_exchange();
+                    stamp(l, 2, grp);
+                    gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
+                    stamp(l, 3, grp);
+                    stamp(l, 4, grp);
+                    stamp(l, 5, grp);
+                } else if (gdn_front_supported(wqkv->native_type, wg->native_type, (int) N)) {
                     // qkv, z and alpha / beta in one launch (profile: all of it on "q8+qkv", conv on "conv")
                     gdn_front(wqkv->native_data, wg->native_data, xq_, qkv + (size_t) tb * C, z_ + (size_t) tb * ZV,
                               (int) N, (int) C, (int) ZV, xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data,
@@ -532,6 +603,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                     (int) HV, te, nullptr, cs, tb);
                 stamp(l, 6, grp);
                 native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
+                if (tp) {
+                    if (wout->native_type != 8) { err = "verify: tensor parallel needs a Q8_0 ssm_out"; return false; }
+                    tp_q8_0_rows(wout->native_data, xq_, bo_ + tb * N, peer_of(bo_ + tb * N), (int) ZV, (int) N,
+                                 tp_rank_ * (int) (N / 2), (int) (N / 2), n, cs, tp_sig);
+                    tp_exchange();
+                } else
                 native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
             } else {
                 // ======================= QSA =======================
@@ -596,6 +673,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                               rope_scaling(), cs);
                 stamp(l, 9, grp);
+                if (tp) {
+                    if (wq->native_type != 8) { err = "verify: tensor parallel needs a Q8_0 attn_q"; return false; }
+                    tp_q8_0_rows(wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, peer_of(qfull_ + tb * NH * 2 * HD), (int) N,
+                                 (int) (NH * 2 * HD), tp_rank_ * (int) (NH * HD), (int) (NH * HD), n, cs, tp_sig);
+                    tp_exchange();
+                } else
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
                 if (qb) {
@@ -651,6 +734,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 14, grp);
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
+                if (tp) {
+                    if (wo->native_type != 8) { err = "verify: tensor parallel needs a Q8_0 attn_output"; return false; }
+                    tp_q8_0_rows(wo->native_data, xq_, bo_ + tb * N, peer_of(bo_ + tb * N), (int) (NH * HD), (int) N,
+                                 tp_rank_ * (int) (N / 2), (int) (N / 2), n, cs, tp_sig);
+                    tp_exchange();
+                } else
                 native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
             }
         } catch (const std::exception& e) {
@@ -696,11 +785,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                           (uint32_t) ((l - lb_) * G + grp + 1), cs);
-        if (!routed)
+        if (!routed && tp_rank_ != 1)   // (tensor parallel rank 1 has no host pool)
             doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                              m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
         stamp(l, 17, grp);
-        {
+        if (tp_rank_ != 1) {   // (tensor parallel: rank 0 adds the shared expert to its partial)
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
                             *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
             if (!wgi || !wsg || !wsu || !wsd) return false;
@@ -739,7 +828,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-        if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+        if (tp_rank_ == 1) {   // tensor parallel: the routed entries this GPU's cache holds, planned here
+            resident_plan_subset(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                                 hits_.cache_base, slot_off_d_, (long long) hits_.blob, pl, capx, cs);
+        } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
             wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
             copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
         } else {
@@ -772,7 +864,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         };
         grouped(p_ptr, p_start, p_counts);
         stamp(l, 20, grp);
-        if (pcie_share_) {   // (no PCIe share: flag B is raised with the plan and nothing waits for it)
+        if (pcie_share_ && tp_rank_ != 1) {   // (no PCIe share: flag B is raised with the plan and nothing waits for it)
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else wait_flag_ge(m_flagB_, ring, cs);             // the PCIe share is in staging (DMA) or mapped
             if (sink_.pcie_mode == 2) {                        // stage it with a copy kernel, then point at staging
@@ -785,7 +877,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr2, p_start2, p_counts + 2);
         }
         stamp(l, 22, grp);
-        if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+        if (tp_rank_ == 1) {   // tensor parallel: no CPU rows here (rank 0 adds them), only this cache's hits
+            cudaMemsetAsync(parts_ + (size_t) tb * K * N, 0, (size_t) n * K * N * sizeof(float), cs);
+        } else if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
             wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
@@ -808,6 +902,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
+        }
+        if (tp && !tp_nosync) {   // tensor parallel: bo = p0 + p1 on both (a sum of two is order-free: the replicas stay alike)
+            tp_push(bo_ + tb * N, peer_of(tp_recv_), (long long) n * N, cs, tp_sig);
+            tp_exchange();
+            tp_add(bo_ + tb * N, tp_recv_, (long long) n * N, cs);
         }
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
@@ -834,6 +933,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         return true;
     }
+
+    if (tp_rank_ == 1) return true;   // tensor parallel: rank 0 runs the head
 
     // ---- the head, T columns, and the argmax of each
     stamp(g.n_layers, 0, 0);
@@ -1093,9 +1194,34 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (tp_rank_ == 1) { err = "verify: tensor parallel rank 1 is driven by rank 0"; return false; }
     if (!capture(T, err) || !capture_commit(err)) return false;
+    if (tp_peer_ != nullptr) {
+        const OnDevice on_peer(tp_peer_->device_);
+        if (!tp_peer_->capture(T, err) || !tp_peer_->capture_commit(err)) return false;
+    }
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
+    if (!stage_inputs(T, tokens, pos0, err)) return false;
+    if (tp_peer_ != nullptr && !tp_peer_->stage_inputs(T, tokens, pos0, err)) return false;
+    ms_host += ms_since(t0);
+    VDBG("staged; launching\n");
+    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    if (tp_peer_ != nullptr) {   // the peer's window runs beside this one; they meet at the exchanges
+        const OnDevice on_peer(tp_peer_->device_);
+        const cudaError_t pe = cudaGraphLaunch(tp_peer_->exec_[T], tp_peer_->cs_);
+        if (pe != cudaSuccess) { err = std::string("verify: tensor parallel peer launch: ") + cudaGetErrorString(pe); return false; }
+        (void) cudaStreamQuery(tp_peer_->cs_);
+    }
+    return run_host_loop(T, pool, user, out, pos0, tokens, err);
+}
+
+bool Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
@@ -1124,11 +1250,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     last_t_ = T;
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
-    ms_host += ms_since(t0);
-    VDBG("staged; launching\n");
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
-    if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs_);
+    return true;
+}
+
+bool Verifier::run_host_loop(int T, PoolMultiFn pool, void* user, int32_t* out, int64_t pos0, const int32_t* tokens,
+                             std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -1187,9 +1316,36 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (tp_peer_ != nullptr) {
+        const OnDevice on_peer(tp_peer_->device_);
+        const cudaError_t pe = cudaStreamSynchronize(tp_peer_->cs_);
+        if (pe != cudaSuccess) { err = std::string("verify: tensor parallel peer: ") + cudaGetErrorString(pe); return false; }
+        uint32_t e0 = 0, e1 = 0;
+        cudaMemcpy(&e1, tp_peer_->tp_err_, 4, cudaMemcpyDeviceToHost);
+        {
+            const OnDevice on_self(device_);
+            cudaMemcpy(&e0, tp_err_, 4, cudaMemcpyDeviceToHost);
+        }
+        if (e0 != 0 || e1 != 0) { err = "verify: tensor parallel exchange timed out"; return false; }
+        ++tp_peer_->windows;
+    }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
-    if (prof_on_ && G == 1) {       // the window's GPU stage stamps
+    if (prof_on_ && G == 1) accumulate_profile();
+    if (tp_peer_ != nullptr && tp_peer_->prof_on_) {
+        const OnDevice on_peer(tp_peer_->device_);
+        tp_peer_->accumulate_profile();
+    }
+    if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
+        ++windows;
+        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+    }
+    return finish_window(T, pos0, tokens, out, err);
+}
+
+void Verifier::accumulate_profile() {
+    const ModelGeometry& g = *g_;
+    {       // the window's GPU stage stamps
         cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
         const int64_t L = g.n_layers;
         auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
@@ -1216,14 +1372,15 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         prof_sum_[0][26] += (double) (at(L, 1) - at(L, 0));
         ++prof_windows_;
     }
+}
+
+bool Verifier::finish_window(int T, int64_t pos0, const int32_t* tokens, int32_t* out, std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
-    if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
-        ++windows;
-        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
-    }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
         SamplerParams sp = sampling_;
@@ -1336,18 +1493,37 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
-bool Verifier::commit(int n_keep, std::string& err) {
-    const OnDevice on_device(device_);
-    if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
-    const Clock::time_point t0 = Clock::now();
+void Verifier::launch_commit(int n_keep) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+bool Verifier::commit(int n_keep, std::string& err) {
+    const OnDevice on_device(device_);
+    if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    launch_commit(n_keep);
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
+    if (tp_peer_ != nullptr) {   // the replica commits the same tokens beside this one
+        const OnDevice on_peer(tp_peer_->device_);
+        tp_peer_->launch_commit(n_keep);
+        const cudaError_t pe = cudaGraphLaunch(tp_peer_->commit_exec_, tp_peer_->cs_);
+        if (pe != cudaSuccess) { err = std::string("verify: tensor parallel peer commit: ") + cudaGetErrorString(pe); return false; }
+    }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    if (tp_peer_ != nullptr) {
+        const OnDevice on_peer(tp_peer_->device_);
+        if (cudaStreamSynchronize(tp_peer_->cs_) != cudaSuccess) { err = "verify: tensor parallel peer commit failed"; return false; }
+        if (tp_peer_->ss_ != ss_ && tp_peer_->ple_stage())
+            for (int t = 0; t < n_keep; ++t) {
+                tp_peer_->ss_->ple_prev[0] = tp_peer_->ss_->ple_prev[1];
+                tp_peer_->ss_->ple_prev[1] = last_tokens_[t];
+            }
+    }
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];

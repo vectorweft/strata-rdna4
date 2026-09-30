@@ -56,6 +56,7 @@
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyPeer hipMemcpyPeer
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess

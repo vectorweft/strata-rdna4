@@ -11,6 +11,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <stdexcept>
 
 namespace strata::kernels {
 namespace {
@@ -618,6 +620,179 @@ namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
 } }
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
+}
+
+// ---- tensor parallel: the exchange between the two ranks' window graphs.  Flags are monotonic counters in each
+// GPU's own VRAM, raised by the peer over P2P and never reset; each rank counts its own waits on the device, so a
+// replayed graph needs no per-window value.
+namespace {
+__device__ __forceinline__ uint32_t tp_load_sys(const uint32_t* f) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __hip_atomic_load(f, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    return *(const volatile uint32_t*) f;
+#endif
+}
+__global__ void tp_signal_kernel(uint32_t* peer_flag) {
+    __threadfence_system();   // this rank's P2P stores (the previous kernels on the stream) before the flag
+#if defined(__HIP_PLATFORM_AMD__)
+    __hip_atomic_fetch_add(peer_flag, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    atomicAdd_system(peer_flag, 1u);
+#endif
+}
+__global__ void tp_wait_kernel(const uint32_t* flag, uint32_t* expect, uint32_t* err) {
+    const uint32_t want = *expect + 1u;
+    *expect = want;
+#if defined(__HIP_PLATFORM_AMD__)
+    const unsigned long long t0 = wall_clock64();   // 100 MHz: a peer that never arrives must not hang the GPU
+    while (tp_load_sys(flag) < want) {
+        strata_spin_pause();
+        if (wall_clock64() - t0 > 500000000ull) { atomicAdd(err, 1u); break; }   // 5 s
+    }
+#else
+    while (tp_load_sys(flag) < want) strata_spin_pause();
+#endif
+    __threadfence_system();
+}
+__device__ unsigned g_tp_push_done;
+__global__ void tp_push_kernel(const float4* __restrict__ src, float4* __restrict__ dst, long long n4, uint32_t* peer_flag) {
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+    if (peer_flag == nullptr) return;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0 && atomicAdd(&g_tp_push_done, 1u) == gridDim.x - 1) {   // the last block signals
+        __threadfence_system();
+        g_tp_push_done = 0;
+#if defined(__HIP_PLATFORM_AMD__)
+        __hip_atomic_fetch_add(peer_flag, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+        atomicAdd_system(peer_flag, 1u);
+#endif
+    }
+}
+__global__ void tp_add_kernel(float4* __restrict__ acc, const float4* __restrict__ recv, long long n4) {
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (long long) gridDim.x * blockDim.x) {
+        const float4 a = acc[i], b = recv[i];
+        acc[i] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+    }
+}
+// rank 1's MoE plan: the routed entries its own cache holds (the rest are rank 0's: its VRAM hits and the CPU's)
+__global__ void resident_plan_subset_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
+                                            int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                                            long long blob, int32_t* __restrict__ pl, long long capx) {
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    int groups = 0, entries = 0;
+    for (int i0 = 0; i0 < n; ++i0) {
+        const int32_t e = ids[i0];
+        if (e < 0 || e >= n_expert || res[e] < 0) continue;
+        bool first = true;
+        for (int j = 0; j < i0; ++j) if (ids[j] == e) { first = false; break; }
+        if (!first) continue;
+        const int32_t slot = res[e];
+        ptr[groups] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+        start[groups] = entries;
+        for (int i = i0; i < n; ++i)
+            if (ids[i] == e) { dst[entries] = i; tok[entries] = i / k; ++entries; }
+        ++groups;
+    }
+    start[groups] = entries;
+    start2[0] = entries;
+    counts[0] = groups;
+    counts[1] = entries;
+    counts[2] = 0;
+}
+}  // namespace
+
+void tp_signal(uint32_t* peer_flag, void* stream) {
+    tp_signal_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(peer_flag);
+    check("tp_signal");
+}
+void tp_wait(const uint32_t* flag, uint32_t* expect, uint32_t* err, void* stream) {
+    tp_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, expect, err);
+    check("tp_wait");
+}
+void tp_push(const float* src, float* peer_dst, long long n, void* stream, uint32_t* peer_flag) {
+    if (n % 4 != 0) throw std::invalid_argument("tp_push: n must be a multiple of 4");
+    const long long n4 = n / 4;
+    const unsigned blocks = (unsigned) std::min<long long>(64, (n4 + 255) / 256);
+    tp_push_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) peer_dst, n4, peer_flag);
+    check("tp_push");
+}
+void tp_add(float* acc, const float* recv, long long n, void* stream) {
+    if (n % 4 != 0) throw std::invalid_argument("tp_add: n must be a multiple of 4");
+    const long long n4 = n / 4;
+    const unsigned blocks = (unsigned) std::min<long long>(64, (n4 + 255) / 256);
+    tp_add_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) acc, (const float4*) recv, n4);
+    check("tp_add");
+}
+void resident_plan_subset(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
+                          const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
+                          long long capx, void* stream) {
+    resident_plan_subset_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, n_entries, k, res_layer, n_expert, cache_base,
+                                                                    slot_off, blob, plan, capx);
+    check("resident_plan_subset");
+}
+
+// ---- the MTP draft head's Q8_0 -> Q4_0 re-quantization on the device (was a host loop over a pageable copy, which
+// fails in --serve once tens of GiB are pinned).  One thread per 32-value block, llama.cpp's
+// quantize_row_q4_0_ref arithmetic on the dequantized Q8_0 values, fp16 scale rounded to nearest even.
+namespace {
+__device__ __forceinline__ float h2f_dev(uint16_t h) {
+    const uint32_t sgn = (uint32_t) (h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    uint32_t u;
+    if (e == 0) {
+        if (m == 0) u = sgn;
+        else { const float f = (float) m * (1.0f / 16777216.0f); u = __float_as_uint(f) | sgn; }
+    } else if (e == 31) u = sgn | 0x7f800000u | (m << 13);
+    else u = sgn | ((e + 112) << 23) | (m << 13);
+    return __uint_as_float(u);
+}
+__device__ __forceinline__ uint16_t f2h_dev(float f) {
+    const uint32_t u = __float_as_uint(f);
+    const uint32_t sgn = (u >> 16) & 0x8000;
+    const int32_t e = (int32_t) ((u >> 23) & 0xff) - 127 + 15;
+    if (e <= 0) return (uint16_t) sgn;
+    if (e >= 31) return (uint16_t) (sgn | 0x7c00);
+    const uint32_t m = u & 0x7fffff, r = m >> 13, rem = m & 0x1fff;
+    uint32_t h = sgn | ((uint32_t) e << 10) | r;
+    if (rem > 0x1000 || (rem == 0x1000 && (r & 1))) ++h;
+    return (uint16_t) h;
+}
+__global__ void q8_0_to_q4_0_kernel(const uint8_t* __restrict__ q8, uint8_t* __restrict__ q4, long long nblocks) {
+    const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblocks) return;
+    const uint8_t* src = q8 + b * 34;
+    uint8_t* dst = q4 + b * 18;
+    const float d8 = h2f_dev((uint16_t) (src[0] | (src[1] << 8)));
+    float x[32], amax = 0.0f, mx = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+        x[j] = d8 * (float) (int8_t) src[2 + j];
+        if (amax < fabsf(x[j])) { amax = fabsf(x[j]); mx = x[j]; }
+    }
+    const float d = mx / -8.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+    const uint16_t dh = f2h_dev(d);
+    dst[0] = (uint8_t) (dh & 0xff);
+    dst[1] = (uint8_t) (dh >> 8);
+    for (int j = 0; j < 16; ++j) {
+        const int a = min(15, (int) (int8_t) (x[j] * id + 8.5f));
+        const int c = min(15, (int) (int8_t) (x[16 + j] * id + 8.5f));
+        dst[2 + j] = (uint8_t) (a | (c << 4));
+    }
+}
+}  // namespace
+
+void q8_0_to_q4_0(const uint8_t* q8, uint8_t* q4, long long nblocks, void* stream) {
+    if (nblocks <= 0) return;
+    q8_0_to_q4_0_kernel<<<(unsigned) ((nblocks + 255) / 256), 256, 0, (cudaStream_t) stream>>>(q8, q4, nblocks);
+    check("q8_0_to_q4_0");
 }
 
 }  // namespace strata::kernels

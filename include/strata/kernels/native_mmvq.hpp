@@ -116,4 +116,17 @@ void gdn_front(const void* w_qkv, const void* w_z, const void* x_q8_1, float* y_
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 
+// Tensor parallel (verify window): rows [row0, row0 + n_rows) of an n_out-row Q8_0 matrix, each bitwise as
+// native_mmvq's exact path, written into y and (when non-null) the peer GPU's y_peer, both laid out [ncols][n_out].
+/// `peer_flag` (optional): the last block raises it by one once every block's P2P rows are fenced (the exchange's
+/// signal, without a kernel of its own).
+void tp_q8_0_rows(const void* w, const void* x_q8_1, float* y, float* y_peer, int n_in, int n_out, int row0, int n_rows,
+                  int ncols, void* stream, uint32_t* peer_flag = nullptr);
+// gdn_front for one rank: qkv rows [q0, q0 + nq) and z rows [z0, z0 + nz) (also into the peer's p_qkv / p_z), and
+// every alpha / beta row locally.  Each value bitwise gdn_front's.
+void tp_gdn_front(const void* w_qkv, const void* w_z, const void* x_q8_1, float* y_qkv, float* y_z, float* p_qkv,
+                  float* p_z, int n_in, int n_qkv, int n_z, int q0, int nq, int z0, int nz, const float* x,
+                  const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a, float* gate,
+                  float* beta, int h_v, int ncols, void* stream, uint32_t* peer_flag = nullptr);
+
 } // namespace strata::kernels

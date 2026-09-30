@@ -101,6 +101,17 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
+    /// TENSOR PARALLEL (two GPUs, replicated state).  Both verifiers hold the whole model and a replica of the
+    /// session; rank 0 (`this` on CUDA0: the host pool, the head, the drafter's residual) and rank 1 (on the other
+    /// GPU, no host work) replay the same window graph side by side.  The big projections are split by rows - GDN
+    /// qkv / z, ssm_out, QSA attn_q, attn_output - and each rank writes its rows into BOTH GPUs' buffers (P2P);
+    /// each rank's MoE partial (rank 1: the experts its own cache holds, planned on the device; rank 0: its VRAM
+    /// hits, the CPU rows and the shared expert) is summed on both.  Everything else runs on both, bitwise alike.
+    /// Call on both after both `init`s (same geometry and max_t): rank 0 drives rank 1 from `run` and `commit`.
+    bool set_tp(int rank, Verifier* peer, std::string& err);
+    int tp_rank() const { return tp_rank_; }
+    /// rank 0: the peer's STRATA_VERIFY_PROFILE line (its stamps are read after every window)
+    std::string tp_peer_profile_report() { return tp_peer_ ? tp_peer_->profile_report() : std::string(); }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
@@ -143,6 +154,23 @@ public:
 
 private:
     bool capture(int T, std::string& err);
+    bool stage_inputs(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    bool run_host_loop(int T, PoolMultiFn pool, void* user, int32_t* out, int64_t pos0, const int32_t* tokens,
+                       std::string& err);
+    void launch_commit(int n_keep);
+    void accumulate_profile();
+    bool finish_window(int T, int64_t pos0, const int32_t* tokens, int32_t* out, std::string& err);
+    /// tensor parallel: the peer's address of a buffer in this verifier's arena (the two carves are identical)
+    template <typename P> P* peer_of(P* p) const {
+        return (P*) ((uint8_t*) tp_peer_->arena_ + ((const uint8_t*) p - (const uint8_t*) arena_));
+    }
+    int tp_rank_ = -1;
+    Verifier* tp_peer_ = nullptr;
+    uint32_t* tp_flag_ = nullptr;     ///< device: raised by the peer (monotonic)
+    uint32_t* tp_expect_ = nullptr;   ///< device: this rank's next expected count
+    uint32_t* tp_err_ = nullptr;      ///< device: a wait that timed out
+    float* tp_recv_ = nullptr;        ///< device: the peer's MoE partial, T x n_embd
+    uint64_t arena_bytes_ = 0;
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
