@@ -279,7 +279,10 @@ struct Prefill::Impl {
         uint8_t *grp_gu = nullptr, *grp_d = nullptr;
         int32_t *src = nullptr, *bounds = nullptr, *ident = nullptr, *host = nullptr;
         std::vector<void*> dev_owned;
-        int64_t experts = 0;
+        int64_t experts = 0, host_experts = 0;
+        // this chunk's RAM-resident experts the helper takes ([layer * n_expert + e]): it DMAs them over its own PCIe
+        // link straight into its group buffer, so the RAM share crosses two links instead of this GPU's one
+        std::vector<uint8_t> take;
     } hp;
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
@@ -1240,11 +1243,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
+        if (hp_on) m.hp.take.assign((size_t) g.n_layers * (size_t) m.g->n_expert, 0);
+        // the share of the RAM-resident (page-locked) experts the helper takes (STRATA_HP_HOST_FRAC, default 0.25: 988 vs 982 at 0.5, 948 at 0.75)
+        static const double hp_host_frac = [] {
+            const char* v = std::getenv("STRATA_HP_HOST_FRAC");
+            const double f = v ? std::atof(v) : 0.25;
+            return f < 0.0 ? 0.0 : f > 1.0 ? 1.0 : f;
+        }();
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
             std::vector<Stager::Job> js;
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
+                double take_acc = 0.0;
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     bool on_helper = false;   // a helper GPU holds it: peer DMA from its slot, no host copy
@@ -1256,6 +1267,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         break;
                     }
                     if (on_helper) continue;
+                    if (hp_on && m.src->pinned(l, e)) {
+                        take_acc += hp_host_frac;
+                        if (take_acc >= 1.0) {   // the helper DMAs this one itself
+                            take_acc -= 1.0;
+                            m.hp.take[(size_t) l * m.g->n_expert + e] = 1;
+                            continue;
+                        }
+                    }
                     const uint8_t* b = m.src->blob(l, e);
                     if (!b) { err = "prefill: expert source has no blob"; return false; }
                     int job = -1;
@@ -1726,7 +1745,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (hp_layer) {
                         rem.assign((size_t) m.g->n_expert, 0);
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
-                            rem[(size_t) e] = m.cnt[(size_t) e] > 0 && m.hp.cache->slot_of(l, e) >= 0 &&
+                            rem[(size_t) e] = m.cnt[(size_t) e] > 0 &&
+                                              (m.hp.cache->slot_of(l, e) >= 0 || m.hp.take[(size_t) l * m.g->n_expert + e]) &&
                                               !(m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0);
                         int32_t pos = 0;
                         for (int pass = 0; pass < 2; ++pass) {
@@ -1825,9 +1845,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 for (int q = 0; q < ngx; ++q) {
                                     const int32_t e = order_r[j0 + (size_t) q];
                                     maxr = std::max<int64_t>(maxr, m.cnt[(size_t) e]);
-                                    const uint8_t* b = h.cache->device_slot(h.cache->slot_of(l, e));
-                                    mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
-                                                       h.grp_gu + (size_t) q * mmq_gub, h.grp_d + (size_t) q * mmq_db, h.cs);
+                                    uint8_t* gdst = h.grp_gu + (size_t) q * mmq_gub;
+                                    uint8_t* ddst = h.grp_d + (size_t) q * mmq_db;
+                                    const int32_t hs = h.cache->slot_of(l, e);
+                                    if (hs >= 0) {
+                                        const uint8_t* b = h.cache->device_slot(hs);
+                                        mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db, gdst, ddst, h.cs);
+                                    } else {   // a page-locked RAM expert: DMA over the helper's own link
+                                        const uint8_t* b = m.src->blob(l, e);
+                                        cudaMemcpyAsync(gdst, b, mmq_gub / 2, cudaMemcpyHostToDevice, h.cs);
+                                        cudaMemcpyAsync(gdst + mmq_gub / 2, b + f.up_off, mmq_gub / 2, cudaMemcpyHostToDevice, h.cs);
+                                        cudaMemcpyAsync(ddst, b + f.down_off, mmq_db, cudaMemcpyHostToDevice, h.cs);
+                                        ++h.host_experts;
+                                    }
                                 }
                                 cudaMemsetAsync(h.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, h.cs);
                                 cudaMemsetAsync(h.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, h.cs);
