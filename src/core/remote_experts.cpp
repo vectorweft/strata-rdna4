@@ -136,7 +136,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     const auto& lay = strata::kernels::cpu::expert_layout();
     // slots == kAutoSlots: as many as the device's free memory holds, in rank order, leaving the reserve below
     const bool auto_size = slots == kAutoSlots;
-    constexpr uint64_t kReserve = 512ull << 20;
+    // + the prompt path's buffers when it computes this GPU's experts here (STRATA_HELPER_PREFILL, prefill.cpp)
+    static const bool helper_prefill = [] { const char* v = std::getenv("STRATA_HELPER_PREFILL"); return !(v && v[0] == '0'); }();
+    const uint64_t kReserve = (512ull + (helper_prefill ? 384ull : 0ull)) << 20;
     size_t free_before = 0, total_before = 0;
     if (!check(cudaMemGetInfo(&free_before, &total_before), "free memory", err, device)) return false;
     const uint64_t budget = free_before > kReserve + (128ull << 20) ? free_before - kReserve - (128ull << 20) : 0;
