@@ -125,7 +125,15 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
-    /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    /// Whether the pool may plan a PCIe share of the misses (--pcie-frac > 0).  Without one the window skips that
+    /// path (the wait for flag B, the staging copy and the second grouped launch: ~5 launches a layer).  A change
+    /// drops the captured windows; call it between windows only.
+    void set_pcie_share(bool on) {
+        if (on == pcie_share_) return;
+        pcie_share_ = on;
+        for (auto& e : exec_)
+            if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
@@ -202,6 +210,7 @@ private:
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
+    bool pcie_share_ = true;
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
