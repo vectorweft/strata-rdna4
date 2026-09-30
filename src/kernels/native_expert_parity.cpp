@@ -9,6 +9,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "ggml-cpu.h"
@@ -178,12 +179,71 @@ int main(int argc, char** argv) {
                 if (cpu::cpu_avx512_ok()) check("avx512", true);   // guarded: the binary runs on AVX-2 CPUs too
                 check("avx2", false);
             }
+            if (cpu::cpu_avx512_ok() && cpu::kq512_gu_supported(f.gu_type)) {
+                // the K-quant AVX-512 kernel against ggml-cpu's vec_dot on the same Q8_K activations, and timing
+                const auto* tc = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
+                std::vector<float> gref((size_t) NT * FF), g((size_t) NT * FF);
+                float* gp[NT];
+                for (int k = 0; k < NT; ++k) {
+                    gp[k] = g.data() + k * FF;
+                    for (int64_t r = 0; r < FF; ++r)
+                        tc->vec_dot((int) H, &gref[k * FF + r], 0, blob.data() + r * f.gu_row, 0, a[k], 0, 1);
+                }
+                cpu::kq512_rows(f.gu_type, blob.data(), f.gu_row, (int) H, a, NT, gp, 0, (int) FF);
+                const double rg = rel(g, gref);
+                std::printf("          %s kq512 gate rows vs ggml vec_dot: rel %.2e\n", ggml_type_name((ggml_type) f.gu_type), rg);
+                if (rg > 1e-5) { std::printf("          kq512 gate MISMATCH\n"); ++failures; }
+                const int it = 50;
+                float* f1[1] = {ffp[0]};
+                auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i)
+                    for (int k = 0; k < NT; ++k)
+                        for (int64_t r = 0; r < FF; ++r) {
+                            float gg, uu;
+                            tc->vec_dot((int) H, &gg, 0, blob.data() + r * f.gu_row, 0, a[k], 0, 1);
+                            tc->vec_dot((int) H, &uu, 0, blob.data() + f.up_off + r * f.gu_row, 0, a[k], 0, 1);
+                        }
+                auto t1 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i) cpu::kq512_gu_rows(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, NT, ffp, 0, (int) FF);
+                auto t2 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i) cpu::kq512_gu_rows(f.gu_type, blob.data(), f.gu_row, f.up_off, (int) H, a, 1, f1, 0, (int) FF);
+                auto t3 = std::chrono::steady_clock::now();
+                auto us = [&](auto x, auto y) { return std::chrono::duration<double, std::micro>(y - x).count() / it; };
+                std::printf("          gate+up one thread: %d tokens kq512 %.0f us vs ggml %.0f us; 1 token kq512 %.0f us vs ggml %.0f us\n",
+                            NT, us(t1, t2), us(t0, t1), us(t2, t3), us(t0, t1) / NT);
+            }
             for (int k = 0; k < NT; ++k) {
                 cpu::native_quant_h(f, ff[k].data(), hq[k].data());
                 hp[k] = hq[k].data();
                 op[k] = got_c.data() + k * H;
             }
             cpu::native_down_rows(f, blob.data(), hp, NT, op, 0, (int) H);
+            if (cpu::cpu_avx512_ok() && cpu::kq512_down_supported(f.d_type)) {
+                const auto* tdc = ggml_get_type_traits_cpu((ggml_type) f.d_type);
+                std::vector<float> dref((size_t) NT * H), dk((size_t) NT * H);
+                float* dp[NT];
+                for (int k = 0; k < NT; ++k) {
+                    dp[k] = dk.data() + k * H;
+                    for (int64_t r = 0; r < H; ++r)
+                        tdc->vec_dot((int) FF, &dref[k * H + r], 0, blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[k], 0, 1);
+                }
+                cpu::kq512_rows(f.d_type, blob.data() + f.down_off, f.d_row, (int) FF, hp, NT, dp, 0, (int) H);
+                const double rd = rel(dk, dref);
+                std::printf("          %s kq512 down vs ggml vec_dot: rel %.2e\n", ggml_type_name((ggml_type) f.d_type), rd);
+                if (rd > 1e-5) { std::printf("          kq512 down MISMATCH\n"); ++failures; }
+                const int it = 50;
+                auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i)
+                    for (int k = 0; k < NT; ++k)
+                        for (int64_t r = 0; r < H; ++r)
+                            tdc->vec_dot((int) FF, &dref[k * H + r], 0, blob.data() + f.down_off + (size_t) r * f.d_row, 0, hp[k], 0, 1);
+                auto t1 = std::chrono::steady_clock::now();
+                for (int i = 0; i < it; ++i) cpu::kq512_rows(f.d_type, blob.data() + f.down_off, f.d_row, (int) FF, hp, NT, dp, 0, (int) H);
+                auto t2 = std::chrono::steady_clock::now();
+                auto us = [&](auto x, auto y) { return std::chrono::duration<double, std::micro>(y - x).count() / it; };
+                std::printf("          down one thread: %d tokens kq512 %.0f us vs ggml %.0f us\n", NT, us(t1, t2), us(t0, t1));
+            }
+
             if (f.d_type == 42) {
                 // (b2) the GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections - the AVX-512 one
                 // where the CPU has it, the AVX-2 one (q2_avx2.cpp) where it does not.  Calling the AVX-512

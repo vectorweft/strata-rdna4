@@ -4,6 +4,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -84,6 +85,14 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
     static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
+    // K-quant gate/up (Q4_K), two or more tokens, opt-in (STRATA_KQ512=1): the AVX-512 VNNI kernel decodes a row
+    // once for the whole window (3 tokens: 162 vs 175 us one thread), but the pool is DRAM-bound (~50 GB/s against
+    // ~30 GB/s per core of ggml's vec_dot), and end to end it measured no gain (79 vs 85-91 tok/s, noise-level)
+    static const bool kq512 = cpu_avx512_ok() && std::getenv("STRATA_KQ512") != nullptr;
+    if (nt >= 2 && kq512 && kq512_gu_supported(f.gu_type)) {   // one token: ggml's Q4_K vec_dot is faster (58 vs 106 us)
+        kq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     if (nt >= 2 && iq512_supported(f.gu_type)) {   // one token: ggml-cpu is as fast or faster
         if (avx512) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -113,6 +122,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
+    static const bool kq512 = cpu_avx512_ok() && std::getenv("STRATA_KQ512") != nullptr;
+    if (nt >= 2 && kq512 && kq512_down_supported(f.d_type) && f.n_ff % 64 == 0) {   // Q5_1 / Q8_0 down
+        kq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     if (nt >= 2 && f.d_type == 20 && iq4nl_mt) {
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
