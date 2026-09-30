@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/router_rows.cuh"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cfloat>
@@ -48,53 +49,7 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     // blockIdx.x = the token (a multi-token launch; 0 for the single one)
     logits += (size_t) blockIdx.x * 512; ids += (size_t) blockIdx.x * 10; weights += (size_t) blockIdx.x * 10;
     if (threadIdx.y != 0) return;
-    const int lane = threadIdx.x;
-    float values[16];
-#pragma unroll
-    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
-    __syncthreads();
-    float maximum = -INFINITY;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
-    maximum = warp_max(maximum);
-    float sum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        values[i] = expf(values[i] - maximum);
-        sum += values[i];
-    }
-    const float reciprocal = 1.0f / warp_sum(sum);
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        values[i] *= reciprocal;
-        if (__isnanf(values[i])) values[i] = -FLT_MAX;
-    }
-    float selected = 0.0f, selected_sum = 0.0f;
-    for (int rank = 0; rank < 10; ++rank) {
-        float best = values[0];
-        int expert = lane;
-#pragma unroll
-        for (int i = 1; i < 16; ++i) {
-            if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
-        }
-#pragma unroll
-        for (int mask = 16; mask; mask >>= 1) {
-            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
-            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
-            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
-        }
-        if ((expert & 31) == lane) {
-            values[expert / 32] = -INFINITY;
-            ids[rank] = expert;
-            // Deliberately accumulate by WINNING EXPERT lane, not output rank.
-            // Multiple selected experts in one lane add in selection order.
-            selected_sum += best;
-        }
-        if (rank == lane) selected = best;
-    }
-    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
-    const float inverse_selected_sum = 1.0f / selected_sum;
-    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+    router_rows::route_top10(logits, ids, weights, threadIdx.x);
 }
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);

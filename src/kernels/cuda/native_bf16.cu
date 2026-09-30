@@ -1,6 +1,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 
+#include "strata/kernels/router_rows.cuh"
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <limits>
@@ -123,61 +124,14 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t 
 // the tokens' activations staged per K tile in LDS and shared by the block's 8 rows.  The MMVF kernel above keeps
 // llama.cpp's CUDA order (bit-identical per token) at one block per row and 4-byte loads, which on this card ran the
 // 512 x 2560 router at ~22 us per layer.  Rounding-level differences only.
-constexpr int FG_TILE = 1024;
-constexpr int FG_ROWS = 8;   // rows per block, one per warp
-__device__ __forceinline__ float fg_dot8(const uint4 w, const float* x) {
-    float acc = 0.0f;
-    const uint32_t v[4] = {w.x, w.y, w.z, w.w};
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        acc = fmaf(__uint_as_float(v[j] << 16), x[2 * j], acc);
-        acc = fmaf(__uint_as_float(v[j] & 0xffff0000u), x[2 * j + 1], acc);
-    }
-    return acc;
-}
+using router_rows::FG_TILE;
+using router_rows::FG_ROWS;
 template <int NT>
 __global__ void __launch_bounds__(256) bf16_rows_multi_kernel(const float* __restrict__ x, int64_t ldx,
                                                               const uint16_t* __restrict__ w, float* __restrict__ y,
                                                               int64_t ldy, int n_in, int n_out, int n_tok) {
     extern __shared__ __align__(16) float xs[];   // [n_tok][FG_TILE]
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int row = blockIdx.x * FG_ROWS + warp;
-    const bool active = row < n_out;
-    const uint4* w4 = reinterpret_cast<const uint4*>(w + (size_t) (active ? row : 0) * n_in);
-    float acc[NT];
-#pragma unroll
-    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
-    for (int base = 0; base < n_in; base += FG_TILE) {
-        const int chunk = min(FG_TILE, n_in - base);
-        uint4 wv[FG_TILE / 8 / 32];
-#pragma unroll
-        for (int q = 0; q < FG_TILE / 8 / 32; ++q) {
-            const int j = lane + 32 * q;
-            wv[q] = (active && j * 8 < chunk) ? __ldg(w4 + base / 8 + j) : make_uint4(0, 0, 0, 0);
-        }
-        __syncthreads();
-        for (int i = threadIdx.x; i < n_tok * (chunk / 4); i += blockDim.x) {
-            const int k = i / (chunk / 4), off = i - k * (chunk / 4);
-            reinterpret_cast<float4*>(xs + k * FG_TILE)[off] = reinterpret_cast<const float4*>(x + (size_t) k * ldx + base)[off];
-        }
-        __syncthreads();
-        if (!active) continue;
-#pragma unroll
-        for (int q = 0; q < FG_TILE / 8 / 32; ++q) {
-            const int j = lane + 32 * q;
-            if (j * 8 >= chunk) break;
-#pragma unroll
-            for (int k = 0; k < NT; ++k)
-                if (k < n_tok) acc[k] += fg_dot8(wv[q], xs + k * FG_TILE + j * 8);
-        }
-    }
-    if (!active) return;
-#pragma unroll
-    for (int k = 0; k < NT; ++k) {
-        if (k >= n_tok) break;
-        const float v = mmvf_warp_sum(acc[k]);
-        if (lane == k) y[(size_t) k * ldy + row] = v;
-    }
+    router_rows::bf16_rows_multi<NT>(x, ldx, w, y, ldy, n_in, n_out, n_tok, xs, blockIdx.x);
 }
 
 int mmvf_block_size(int64_t n_in) {
@@ -194,6 +148,11 @@ int mmvf_block_size(int64_t n_in) {
 }
 
 }  // namespace
+
+bool fast_gemv_on() {
+    static const bool fast = [] { const char* v = std::getenv("STRATA_FAST_GEMV"); return v == nullptr || std::atoi(v) != 0; }();
+    return fast;
+}
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {

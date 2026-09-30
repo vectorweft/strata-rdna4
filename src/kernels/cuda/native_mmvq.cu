@@ -995,7 +995,7 @@ struct SmallTraits {
 // ncols = 1 layout and keeps every column bitwise equal to a single-column call. The UPSTREAM layout is
 // llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster,
 // equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
-bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
+bool g_multi_exact = [] { const char* v = std::getenv("STRATA_MMVQ_UPSTREAM"); return !(v && v[0] == '1'); }();   // STRATA_MMVQ_UPSTREAM=1: the upstream layout
 
 template<typename F, int NCOLS, int NW, int ROWS>
 __device__ __forceinline__ void mmvq_multi_rows(const typename F::Block* __restrict__ w,

@@ -662,7 +662,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        RouterFusedArgs rf;
+        bool routed = false;
+        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10 && fast_gemv_on()) {
+            // router, top-10, device plan and doorbell in one launch (STRATA_ROUTER_FUSED=0: four)
+            rf.x = xm; rf.n_embd = (int) N; rf.n_tok = n; rf.w = (const uint16_t*) w_router->data;
+            rf.logits = logits_ + tb * NE; rf.ids = ids_ + tb * K; rf.weights = w_ + tb * K;
+            if (device_plan_) {
+                rf.res_layer = hits_.d_res + l * g.n_expert; rf.n_expert = (int) g.n_expert; rf.cache_base = hits_.cache_base;
+                rf.slot_off = slot_off_d_; rf.blob = (long long) hits_.blob;
+                rf.plan = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16); rf.capx = (long long) max_t_ * K;
+                rf.skip = skip_ + grp; rf.ring = (uint32_t) ((l - lb_) * G + grp + 1);
+            }
+            rf.x_out = m_x_ + tb * N; rf.ids_out = m_ids_ + tb * K; rf.w_out = m_w_ + tb * K; rf.seq = m_seq_;
+            routed = router_fused(rf, cs);
+        }
+        if (routed) {
+        } else if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
@@ -674,13 +690,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+        if (!routed && device_plan_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                           (uint32_t) ((l - lb_) * G + grp + 1), cs);
-        doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                         m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+        if (!routed)
+            doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                             m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
         stamp(l, 17, grp);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),

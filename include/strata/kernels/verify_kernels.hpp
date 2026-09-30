@@ -55,6 +55,22 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream);
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's
 /// layout (counts | start | dst | tok | pad | ptr | ptr2 | start2, `capx` entries) and order (distinct experts in
 /// routing order, their entries ascending), no PCIe groups.  *skip = ring when it did, else 0.
+/// The verify window's router in one launch (see verify_kernels.cu): logits = W_router . x (512 BF16 rows, the fast
+/// multi-row GEMV), the top-10 ids / weights of every token, the device plan when `plan` is set (resident_plan's
+/// arguments) and the doorbell (doorbell_publish's) - bitwise what those four launches produce.  False (nothing
+/// launched) outside 2..kVerifyMaxT tokens, on misaligned rows or with STRATA_ROUTER_FUSED=0.
+struct RouterFusedArgs {
+    const float* x = nullptr; int n_embd = 0; int n_tok = 0;
+    const uint16_t* w = nullptr;
+    float* logits = nullptr; int32_t* ids = nullptr; float* weights = nullptr;
+    // the device plan (null plan: none)
+    const int32_t* res_layer = nullptr; int n_expert = 0; const uint8_t* cache_base = nullptr;
+    const unsigned long long* slot_off = nullptr; long long blob = 0; int32_t* plan = nullptr; long long capx = 0;
+    uint32_t* skip = nullptr; uint32_t ring = 0;
+    // the doorbell
+    float* x_out = nullptr; int32_t* ids_out = nullptr; float* w_out = nullptr; uint32_t* seq = nullptr;
+};
+bool router_fused(const RouterFusedArgs& a, void* stream);
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream);

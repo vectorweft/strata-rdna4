@@ -4,6 +4,7 @@
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gdn_ab_row.cuh"
+#include "strata/kernels/router_rows.cuh"
 
 #include <cuda_runtime.h>
 
@@ -423,10 +424,10 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
 }  // namespace
 
 namespace {
-__global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
-                                     int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
-                                     long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
-                                     uint32_t ring) {
+__device__ __forceinline__ void resident_plan_one(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
+                                                  int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                                                  long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
+                                                  uint32_t ring) {
     // one thread: at most kVerifyMaxT * 10 entries, the host's exact loop
     for (int i = 0; i < n; ++i) {
         const int32_t e = ids[i];
@@ -464,6 +465,61 @@ __global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int
     __threadfence();
     *skip = ring;
 }
+__global__ void resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,
+                                     int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                                     long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip,
+                                     uint32_t ring) {
+    resident_plan_one(ids, n, k, res, n_expert, cache_base, slot_off, blob, pl, capx, skip, ring);
+}
+
+// ---- the verify window's router in ONE launch (router_fused): 64 blocks of 8 rows run the 512 x n_embd BF16 GEMV
+// (router_rows::bf16_rows_multi, the fast multi-row GEMV's arithmetic) and copy a slice of the activation to the
+// host's doorbell rows; the LAST block to finish (a counter, no spinning) runs the top-10 of every token (one warp
+// each, router_rows::route_top10), the device plan and the doorbell - what the router, top-10, resident_plan and
+// doorbell_publish kernels did as four launches, bitwise.
+__device__ unsigned g_router_done;
+__device__ __forceinline__ void doorbell_store_sys(uint32_t* seq, uint32_t v) {
+#if defined(__HIP_PLATFORM_AMD__)
+    __hip_atomic_store(seq, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    *(volatile uint32_t*) seq = v;
+#endif
+}
+template <int NT>
+__global__ void __launch_bounds__(256) router_fused_kernel(RouterFusedArgs a) {
+    extern __shared__ __align__(16) float xs[];   // [n_tok][FG_TILE]
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int n_x = a.n_tok * a.n_embd;
+    {   // this block's slice of the doorbell activation rows (host-mapped)
+        const int per = ((n_x / 4 + (int) gridDim.x - 1) / (int) gridDim.x) * 4;
+        const int b0 = (int) blockIdx.x * per, b1 = min(n_x, b0 + per);
+        for (int i = b0 + 4 * t; i < b1; i += 4 * (int) blockDim.x)
+            *reinterpret_cast<float4*>(a.x_out + i) = *reinterpret_cast<const float4*>(a.x + i);
+    }
+    router_rows::bf16_rows_multi<NT>(a.x, a.n_embd, a.w, a.logits, 512, a.n_embd, 512, a.n_tok, xs, blockIdx.x);
+    __shared__ bool last;
+    __syncthreads();
+    if (t == 0) {
+        __threadfence_system();   // the logits (device) and the activation slice (host) before the arrival
+        last = atomicAdd(&g_router_done, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) return;
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    if (warp < a.n_tok) router_rows::route_top10(a.logits + warp * 512, a.ids + warp * 10, a.weights + warp * 10, lane);
+    __syncthreads();
+    if (t == 0 && a.plan)
+        resident_plan_one(a.ids, a.n_tok * 10, 10, a.res_layer, a.n_expert, a.cache_base, a.slot_off, a.blob, a.plan,
+                          a.capx, a.skip, a.ring);
+    for (int i = t; i < a.n_tok * 10; i += (int) blockDim.x) { a.ids_out[i] = a.ids[i]; a.w_out[i] = a.weights[i]; }
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        __threadfence_system();
+        doorbell_store_sys(a.seq, *(volatile uint32_t*) a.seq + 1u);
+        __hip_atomic_store(&g_router_done, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+}
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
     while (*flag < value) __nanosleep(100);
@@ -489,6 +545,20 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                                                              blob, plan, capx, skip, ring);
     check("resident_plan");
 }
+bool router_fused(const RouterFusedArgs& a, void* stream) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_ROUTER_FUSED"); return !(v && v[0] == '0'); }();
+    auto al = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15u) == 0; };
+    if (!on || a.n_tok < 2 || a.n_tok > kVerifyMaxT || a.n_embd % 8 != 0 || !al(a.x) || !al(a.w) || !al(a.x_out) ||
+        !a.logits || !a.ids || !a.weights || !a.ids_out || !a.w_out || !a.seq)
+        return false;
+    const unsigned blocks = 512 / router_rows::FG_ROWS;   // 64
+    const size_t lds = (size_t) a.n_tok * router_rows::FG_TILE * sizeof(float);
+    if (a.n_tok <= 4) router_fused_kernel<4><<<blocks, 256, lds, (cudaStream_t) stream>>>(a);
+    else router_fused_kernel<8><<<blocks, 256, lds, (cudaStream_t) stream>>>(a);
+    check("router_fused");
+    return true;
+}
+
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
     check("wait_flag_ge_or");
