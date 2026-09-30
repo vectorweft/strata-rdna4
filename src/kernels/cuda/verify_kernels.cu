@@ -5,6 +5,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gdn_ab_row.cuh"
 #include "strata/kernels/router_rows.cuh"
+#include "strata/kernels/dp4a.hpp"
 
 #include <cuda_runtime.h>
 
@@ -418,7 +419,7 @@ void gdn_step_commit_layers(float* state, size_t state_stride, const float* h, s
 
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
-    while (*flag < value) __nanosleep(100);
+    while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }
 }  // namespace
@@ -522,7 +523,7 @@ __global__ void __launch_bounds__(256) router_fused_kernel(RouterFusedArgs a) {
 }
 __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip) {
     if (*skip == value) return;
-    while (*flag < value) __nanosleep(100);
+    while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
@@ -609,7 +610,7 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 namespace { __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
     unsigned long long t;
 #if defined(__HIPCC__)
-    t = wall_clock64() * 10ull;   // gfx11: a constant 100 MHz counter, in ns
+    t = wall_clock64() * 10ull;   // gfx11 / gfx12: a constant 100 MHz counter, in ns
 #else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
 #endif
