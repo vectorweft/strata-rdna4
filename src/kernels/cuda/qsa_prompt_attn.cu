@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 namespace strata::kernels {
@@ -672,6 +673,241 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
     return true;
 }
 
+
+#if defined(__HIPCC__)
+// ---- RDNA4 (gfx12): the same algorithm on WMMA 16x16x16 (f16 in, f32 accumulate).  Fragment layout (wave32):
+//   A: lane L holds A[m = L % 16][k = 8 (L / 16) + i], B: B[k = 8 (L / 16) + i][n = L % 16], D: D[m = 8 (L / 16) + i]
+//   [n = L % 16], i = 0..7.  One block per (query, KV head), 4 waves; chunks of 64 cells: the scores' n-tile of wave w
+//   is cells 16w..16w+15 over all 256 dims (per 64-dim int8 scale group), p.v's are dims 64w..64w+63 (its scale
+//   group) as four n-tiles.  q and p are split into f16 hi + lo parts as in the CUDA kernel.  INT8 KV only (mode 1).
+typedef _Float16 wh8 __attribute__((ext_vector_type(8)));
+typedef float wf8 __attribute__((ext_vector_type(8)));
+constexpr int WCH = 64;
+constexpr int WTHREADS = 128;
+struct SmemW {
+    _Float16 qh[16][HD + 8];
+    _Float16 ql[16][HD + 8];
+    int8_t k[WCH][HD + 16];
+    int8_t v[WCH][HD + 16];
+    float ks[WCH][4];
+    float vs[WCH][4];
+    float s[16][WCH + 1];
+    float qmax[WTHREADS / 32];
+    float alpha[16];
+    float lsum[16];
+    float mrow[16];
+    long long row[WCH];
+};
+__device__ __forceinline__ wh8 i8x8_to_h8(uint2 x) {
+    wh8 h;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h[i] = (_Float16) (int) (int8_t) ((x.x >> (8 * i)) & 0xffu);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h[4 + i] = (_Float16) (int) (int8_t) ((x.y >> (8 * i)) & 0xffu);
+    return h;
+}
+__global__ void __launch_bounds__(WTHREADS) prompt_attn_wmma_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                                  const int32_t* __restrict__ ids,
+                                                                  const int32_t* __restrict__ steps, int n_kv_heads,
+                                                                  int page_size, float scale_log2,
+                                                                  float* __restrict__ attn, int cap) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    SmemW& S = *reinterpret_cast<SmemW*>(smem_raw);
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int lr = lane & 15, lh = lane >> 4;   // fragment row/col, K half
+
+    float qm = 0.0f;
+    for (int i = t; i < G * HD; i += WTHREADS) qm = fmaxf(qm, fabsf(q[i]));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
+    if (lane == 0) S.qmax[warp] = qm;
+    __syncthreads();
+    qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+    int qe = 0;
+    if (qm > 0.0f) frexpf(qm, &qe);
+    const float qup = ldexpf(1.0f, 14 - qe), qdown = ldexpf(scale_log2, qe - 14);
+    for (int i = t; i < 16 * HD; i += WTHREADS) {
+        const int h = i / HD, d = i % HD;
+        const float x = h < G ? q[(size_t) h * HD + d] * qup : 0.0f;
+        const _Float16 hi = (_Float16) x;
+        S.qh[h][d] = hi;
+        S.ql[h][d] = (_Float16) (x - (float) hi);
+    }
+    if (t < 16) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+    wf8 acc[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[j] = (wf8) {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (int c0 = 0; c0 < n; c0 += WCH) {
+        const int nh = min(WCH, n - c0);
+        if (t < WCH) {
+            long long r = -1;
+            if (t < nh) {
+                const int cell = ids[c0 + t];
+                const long long page = (long long) p.page_table[cell / page_size];
+                r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
+            S.row[t] = r;
+        }
+        __syncthreads();
+        for (int i = t; i < WCH * (HD / 16); i += WTHREADS) {
+            const int c = i / (HD / 16), pc = i % (HD / 16);
+            const long long r = S.row[c];
+            uint4 kx = make_uint4(0, 0, 0, 0), vx = make_uint4(0, 0, 0, 0);
+            if (r >= 0) {
+                kx = __ldg(reinterpret_cast<const uint4*>(p.k_q + r * HD) + pc);
+                vx = __ldg(reinterpret_cast<const uint4*>(p.v_q + r * HD) + pc);
+            }
+            *reinterpret_cast<uint4*>(&S.k[c][pc * 16]) = kx;
+            *reinterpret_cast<uint4*>(&S.v[c][pc * 16]) = vx;
+        }
+        for (int i = t; i < WCH * 4; i += WTHREADS) {
+            const int c = i / 4, g = i % 4;
+            const long long r = S.row[c];
+            float a = 0.0f, b = 0.0f;
+            if (r >= 0) {
+                a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
+                b = __half2float(__ushort_as_half(p.v_scale[r * (HD / KV_Q8_GROUP) + g]));
+            }
+            S.ks[c][g] = a;
+            S.vs[c][g] = b;
+        }
+        __syncthreads();
+        {   // scores of cells 16w + (0..15): D[head][cell]
+            const int cell = warp * 16 + lr;
+            wf8 sc = (wf8) {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                wf8 tg = (wf8) {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    const int k0 = (g * 4 + kk) * 16 + 8 * lh;
+                    const wh8 ah = *reinterpret_cast<const wh8*>(&S.qh[lr][k0]);
+                    const wh8 al = *reinterpret_cast<const wh8*>(&S.ql[lr][k0]);
+                    const wh8 b = i8x8_to_h8(*reinterpret_cast<const uint2*>(&S.k[cell][k0]));
+                    tg = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ah, b, tg);
+                    tg = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(al, b, tg);
+                }
+                const float ksc = S.ks[cell][g];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) sc[i] = fmaf(tg[i], ksc, sc[i]);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) S.s[8 * lh + i][cell] = cell < nh ? sc[i] * qdown : -INFINITY;
+        }
+        __syncthreads();
+        {   // online softmax: row t / 8, 8 cells per thread
+            constexpr int PER = WCH / 8;
+            const int r = t >> 3, sub = t & 7;
+            float x[PER], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) { x[j] = S.s[r][sub * PER + j]; mx = fmaxf(mx, x[j]); }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const float e = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                S.s[r][sub * PER + j] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[r] = a;
+                S.lsum[r] = fmaf(S.lsum[r], a, sum);
+                S.mrow[r] = m_new;
+            }
+        }
+        __syncthreads();
+        {   // p.v: dims 64w + 16j + (0..15), the scale folded into p relative to the chunk's largest (x 2^14)
+            float vmax = 0.0f;
+            for (int c = lane; c < WCH; c += 32) vmax = fmaxf(vmax, S.vs[c][warp]);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+            const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
+            wf8 tmp[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) tmp[j] = (wf8) {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int ks = 0; ks < WCH / 16; ++ks) {
+                const int cb = ks * 16 + 8 * lh;
+                wh8 ph, pl;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float pv = S.s[lr][cb + i] * (S.vs[cb + i][warp] * vup);
+                    const _Float16 h = (_Float16) pv;
+                    ph[i] = h;
+                    pl[i] = (_Float16) (pv - (float) h);
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int d = warp * 64 + j * 16 + lr;
+                    wh8 b;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) b[i] = (_Float16) (int) S.v[cb + i][d];
+                    tmp[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(ph, b, tmp[j]);
+                    tmp[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pl, b, tmp[j]);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float a = S.alpha[8 * lh + i];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[j][i] = fmaf(acc[j][i], a, tmp[j][i] * vdown);
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int m = 8 * lh + i;
+        if (m >= G) continue;
+        const float l = S.lsum[m], inv = l > 0.0f ? 1.0f / l : 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) attn[(size_t) m * HD + warp * 64 + j * 16 + lr] = acc[j][i] * inv;
+    }
+}
+
+bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                 const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+    static bool attr[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const int bytes = (int) sizeof(SmemW);
+    if (dev < 0 || dev >= 64) return false;
+    if (!attr[dev]) {
+        if (cudaFuncSetAttribute(prompt_attn_wmma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        attr[dev] = true;
+    }
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        prompt_attn_wmma_kernel<<<dim3((unsigned) nb, (unsigned) s.n_head_kv), WTHREADS, bytes, st>>>(
+            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch (wmma): %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
+#endif  // __HIPCC__
+
 }  // namespace
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
@@ -692,7 +928,24 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         if (cc_major[dev] < 8) return false;
     }
 #if defined(__HIPCC__)
-    return false;   // the tensor-core kernel is compiled out on AMD (its major version is not a CUDA sm)
+    // AMD: the RDNA4 WMMA kernel for INT8 KV (gfx12 only; STRATA_PROMPT_ATTN_WMMA=0: the FP32 decode kernel);
+    // the other KV forms keep the decode kernel
+    {
+        static const bool wmma_on = [] { const char* v = std::getenv("STRATA_PROMPT_ATTN_WMMA"); return !(v && v[0] == '0'); }();
+        hipDeviceProp_t prop;
+        int dev = 0;
+        static int gfx12[64] = {};
+        if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+        if (gfx12[dev] == 0) {
+            gfx12[dev] = hipGetDeviceProperties(&prop, dev) == hipSuccess && std::strncmp(prop.gcnArchName, "gfx12", 5) == 0 ? 1 : -1;
+            cudaGetLastError();
+        }
+        if (!wmma_on || gfx12[dev] < 0 || pools.k_q4 != nullptr || pools.v_q4 != nullptr || !pools.k_q || !pools.v_q ||
+            !pools.k_scale || !pools.v_scale || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 ||
+            !ids || !steps || !pools.page_table)
+            return false;
+        return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+    }
 #endif
     if (pools.k_q4 != nullptr || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids ||
         !steps || !pools.page_table)

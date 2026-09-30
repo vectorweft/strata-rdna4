@@ -439,6 +439,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(shared_expert_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME shared_expert_parity COMMAND shared_expert_parity --selftest)
 
+  # the prompt attention parity (the tensor kernel vs the FP32 decode kernel and FP64) - on HIP the RDNA4 WMMA one
+  if(STRATA_ENABLE_HIP)
+    add_executable(qsa_prompt_attn_parity_hip src/kernels/qsa_prompt_attn_parity.cpp)
+    target_include_directories(qsa_prompt_attn_parity_hip PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(qsa_prompt_attn_parity_hip PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  endif()
   add_executable(gr_bench src/kernels/gr_bench.cpp)
   target_include_directories(gr_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(gr_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
