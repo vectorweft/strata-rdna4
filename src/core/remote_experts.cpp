@@ -138,7 +138,9 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     const bool auto_size = slots == kAutoSlots;
     // + the prompt path's buffers when it computes this GPU's experts here (STRATA_HELPER_PREFILL, prefill.cpp)
     static const bool helper_prefill = [] { const char* v = std::getenv("STRATA_HELPER_PREFILL"); return !(v && v[0] == '0'); }();
-    const uint64_t kReserve = (512ull + (helper_prefill ? 384ull : 0ull)) << 20;
+    // STRATA_HELPER_RESERVE_MIB: the base (default 512) - the driver's and this GPU's own staging headroom
+    static const uint64_t base_mib = [] { const char* v = std::getenv("STRATA_HELPER_RESERVE_MIB"); return v ? (uint64_t) std::atoll(v) : 512ull; }();
+    const uint64_t kReserve = (base_mib + (helper_prefill ? 384ull : 0ull)) << 20;
     size_t free_before = 0, total_before = 0;
     if (!check(cudaMemGetInfo(&free_before, &total_before), "free memory", err, device)) return false;
     const uint64_t budget = free_before > kReserve + (128ull << 20) ? free_before - kReserve - (128ull << 20) : 0;
