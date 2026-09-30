@@ -69,5 +69,7 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
+/// b[0] = 0, b[1] = rows: one "expert" over every row (a dense projection through the MoE launch).
+void set_bounds(int32_t* b, int64_t rows, void* stream);
 
 }  // namespace strata::prefill::mmq

@@ -154,6 +154,14 @@ void Context::run(const Product& p, void* stream) {
     ck(cudaGetLastError(), "mul_mat_q");
 }
 
+namespace {
+__global__ void set_bounds_kernel(int32_t* b, int32_t rows) { b[0] = 0; b[1] = rows; }
+}
+void set_bounds(int32_t* b, int64_t rows, void* stream) {
+    set_bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(b, (int32_t) rows);
+    ck(cudaGetLastError(), "set_bounds");
+}
+
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream) {
     const cudaStream_t s = (cudaStream_t) stream;
