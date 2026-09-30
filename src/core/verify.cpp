@@ -50,6 +50,33 @@
 
 namespace strata::core {
 namespace {
+// Debug (STRATA_DEBUG_PLE=<file>): the residual of the window's first row entering layer 1 before and after the PLE
+// block, both HC x n_embd f32, written at exit.  The copies ride in the captured graph, so the file holds the
+// LAST window's values.  Diagnostic only; off unless the variable is set.
+struct DebugPle {
+    float* host = nullptr;
+    float* dev = nullptr;     // PleOut targets: value N | gate HC(pad 64) | gated | conv
+    size_t floats = 0;
+    std::string path;
+    static DebugPle& get() { static DebugPle d; return d; }
+    float* buf(size_t n) {
+        if (host) return host;
+        const char* p = std::getenv("STRATA_DEBUG_PLE");
+        if (!p || !*p) return nullptr;
+        floats = 4 * n + 2 * 2560 + 64;
+        if (cudaHostAlloc((void**) &host, floats * sizeof(float), cudaHostAllocDefault) != cudaSuccess) return host = nullptr;
+        if (cudaMalloc((void**) &dev, (2 * n + 2560 + 64) * sizeof(float)) != cudaSuccess) return host = nullptr;
+        path = p;
+        std::atexit([] {
+            DebugPle& d = get();
+            if (FILE* f = std::fopen(d.path.c_str(), "wb")) { std::fwrite(d.host, sizeof(float), d.floats, f); std::fclose(f); }
+        });
+        return host;
+    }
+};
+}  // namespace
+
+namespace {
 
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
@@ -301,6 +328,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { cudaGetLastError(); device_plan_ = false; }
     }
+    DebugPle::get().buf((size_t) (g.hc * g.n_embd));   // before any capture
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
     return true;
@@ -406,14 +434,28 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
+            float* dbg = DebugPle::get().buf((size_t) (HC * N));
             for (int t = tb; t < te; ++t) {
                 gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+                if (dbg && t == tb) {
+                    cudaMemcpyAsync(dbg, Rt(t), (size_t) (HC * N) * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(dbg + 2 * HC * N, ple_ + t * N, (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                }
                 PleOut po;
+                float* ddev = DebugPle::get().dev;
+                if (dbg && t == tb) {
+                    po.value = ddev; po.gate = ddev + N; po.gated = ddev + N + 64; po.conv = ddev + N + 64 + HC * N;
+                }
                 po.normalized = normalized;
                 po.result = Rt(t);
                 try {
                     ple_block(ple_ + t * N, Rt(t), ss.ple.hist, ss.ple.w, po, ss.ple.scratch, cs);
                     ple_history_advance(ss.ple.hist, normalized, cs);
+                    if (dbg && t == tb) {
+                        cudaMemcpyAsync(dbg + HC * N, Rt(t), (size_t) (HC * N) * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                        cudaMemcpyAsync(dbg + 2 * HC * N + N, ddev, (size_t) (N + 64 + 2 * HC * N) * sizeof(float),
+                                        cudaMemcpyDeviceToHost, cs);
+                    }
                 } catch (const std::exception& e) {
                     err = std::string("verify PLE: ") + e.what();
                     return false;

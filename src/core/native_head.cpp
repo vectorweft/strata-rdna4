@@ -23,8 +23,13 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
     }
     try {
         strata::GgufFile gguf(path);
-        err = strata::check_architecture(gguf);
-        if (!err.empty()) return false;
+        // a continuation shard of a split model (split.no > 0) carries no architecture metadata; shard 1 was
+        // checked with the whole set by the dense loader
+        const strata::MetaValue* split_no = gguf.get("split.no");
+        if (gguf.get("general.architecture") || !split_no || split_no->u == 0) {
+            err = strata::check_architecture(gguf);
+            if (!err.empty()) return false;
+        }
         const strata::TensorInfo* tensor = nullptr;
         for (const auto& candidate : gguf.tensors()) {
             if (candidate.name != "output.weight") continue;

@@ -56,6 +56,9 @@ BF16_PROJECTIONS = (
     "ple_value.weight", *ROUTERS,
 )
 BF16_OUTPUT = {"output_hc_down.weight", "output_hc_up.weight"}
+# Read as F16 by the PLE depthwise conv (PleWeights::conv1d_f16). GSQ-RCO files store it F16; Unsloth's UD quants
+# keep it F32, whose bytes read as F16 made layer 1's PLE conv ~40x too large.
+F16_PROJECTIONS = ("ple_conv1d.weight",)
 
 
 def needs_bf16(name: str, type_name: str) -> bool:
@@ -65,6 +68,20 @@ def needs_bf16(name: str, type_name: str) -> bool:
         return False
     # The existing native PLE key supports Q2_0 only. Other key encodings use the BF16 path.
     return name.endswith(BF16_PROJECTIONS) or (name == "blk.1.ple_key.weight" and type_name != "Q2_0")
+
+
+def needs_f16(name: str) -> bool:
+    return name.startswith("blk.") and name.endswith(F16_PROJECTIONS)
+
+
+def f16_bytes(raw: np.ndarray, type_name: str) -> bytes:
+    from _paths import add_gguf_py
+    add_gguf_py()
+    from gguf import GGMLQuantizationType as Q, quants
+    values = quants.dequantize(raw, Q[type_name])
+    if not np.isfinite(values).all() or np.abs(values).max() > 65504.0:
+        raise ValueError("cannot convert weights to F16: non-finite or out of range")
+    return values.astype(np.float16).tobytes()
 
 
 def bf16_bytes(raw: np.ndarray, type_name: str) -> bytes:
@@ -142,6 +159,9 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
                     t.type_name == "F32" and name.endswith(ROUTERS)):
                 print(f"{name} is {t.type_name}, but the engine requires BF16; use --compat-bf16")
                 return 1
+            if needs_f16(name) and t.type_name != "F16":
+                print(f"{name} is {t.type_name}, but the engine requires F16; use --compat-bf16")
+                return 1
     rows, at = [], 0
     served = 0
     converted = []
@@ -155,9 +175,14 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
             ne0 = int(t.shape[0])
             ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
             convert = compat_bf16 and needs_bf16(t.name, t.type_name) and t.type_name != "BF16"
-            if t.type_name in FLOAT or convert:
+            convert16 = compat_bf16 and needs_f16(t.name) and t.type_name != "F16"
+            if t.type_name in FLOAT or convert or convert16:
                 raw = tensor_bytes(mm, g, t).tobytes()
-                if convert:
+                if convert16:
+                    raw = f16_bytes(np.frombuffer(raw, dtype=np.uint8), t.type_name)
+                    kind = "5"
+                    converted.append({"name": t.name, "source_type": t.type_name, "to": "F16", "bytes": len(raw)})
+                elif convert:
                     raw = bf16_bytes(np.frombuffer(raw, dtype=np.uint8), t.type_name)
                     kind = "4"
                     converted.append({"name": t.name, "source_type": t.type_name, "bytes": len(raw)})
