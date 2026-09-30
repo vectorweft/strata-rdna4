@@ -984,11 +984,11 @@ namespace {
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfCount };
+               kPfHcUp, kPfHcMix, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj"};
+                                        "gdn recurrence", "gdn out proj", "hc up", "hc inject+mix"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
@@ -1471,8 +1471,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     uint8_t* bu = blk + (dbytes + kTail + 255) / 256 * 256;
                     strata::kernels::hc_q8_to_blocks(wd->hc_q8, wd->ne1, wd->ne0, blk, kTail, m.cs);
                     strata::kernels::hc_q8_to_blocks(wu->hc_q8, wu->ne1, wu->ne0, bu, kTail, m.cs);
-                    gr_xn_rows(m.R, m.grs, (const float*) wn->data, m.xnf, T, m.cs);
+                    gr_xn_inject(m.R, m.grs, (const float*) wn->data, (const uint16_t*) wi->data, m.xnf, m.inj, T, m.cs);
                     mmq_dense(m, blk, 8, wd->ne1, wd->ne0, m.xnf, m.lo, T, 0);
+                    pt.mark(kPfHcUp, cs);
                     gr_silu_f(m.lo, m.lof, T, m.cs);
                     mmq_dense(m, bu, 8, wu->ne1, wu->ne0, m.lof, m.gated, T, 0);
                 } else {
@@ -1480,7 +1481,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     gr_silu(m.lo, m.lo16, T, m.cs);
                     if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
                 }
-                if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
+                pt.mark(kPfHcMix, cs);
+                if (!hc_mmq && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;   // (MMQ: gr_xn_inject)
                 if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
                 else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
 

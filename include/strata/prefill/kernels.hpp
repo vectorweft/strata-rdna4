@@ -26,6 +26,9 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
                       float* rs, uint16_t* xn16, int64_t T, void* stream);
 /// xn[t, c*2560 + d] = R * rs[t*4 + c] * w_norm (gr_norm_rs's rows in FP32, for the MMQ quantizer)
 void gr_xn_rows(const float* R, const float* rs, const float* w_norm, float* xn, int64_t T, void* stream);
+/// gr_xn_rows and inj[t, c] = w_inject[c] . xn[t] (w_inject bf16 [hc][hc * n_embd]) in one pass, a block per token
+void gr_xn_inject(const float* R, const float* rs, const float* w_norm, const uint16_t* w_inject, float* xn, float* inj,
+                  int64_t T, void* stream);
 /// out[t, k] = silu(lo[t, k] / hc) in FP32
 void gr_silu_f(const float* lo, float* out, int64_t T, void* stream);
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))

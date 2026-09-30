@@ -141,6 +141,29 @@ __global__ void gr_xn_rows_kernel(const float* __restrict__ R, const float* __re
     const int c = (int) (row % HC);
     xn[i] = R[i] * rs[row] * w[c * N + (i % N)];
 }
+// gr_xn_rows for one token per block, and the injection's four dots over the same values: inj[t][c'] =
+// w_inject[c'] . xn[t] (bf16 weights, FP32 activations) - the separate N = 4 GEMM ran at 0.5 TFLOPS on rocBLAS
+__global__ void __launch_bounds__(256) gr_xn_inject_kernel(const float* __restrict__ R, const float* __restrict__ rs,
+                                                           const float* __restrict__ w, const uint16_t* __restrict__ wi,
+                                                           float* __restrict__ xn, float* __restrict__ inj) {
+    __shared__ float sh[32];
+    const int64_t t = blockIdx.x;
+    const float* r = R + t * D;
+    float* o = xn + t * D;
+    float acc[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        const int c = i / N;
+        const float v = r[i] * rs[t * HC + c] * w[i];
+        o[i] = v;
+#pragma unroll
+        for (int k = 0; k < HC; ++k) acc[k] = fmaf(__uint_as_float((uint32_t) wi[(size_t) k * D + i] << 16), v, acc[k]);
+    }
+#pragma unroll
+    for (int k = 0; k < HC; ++k) {
+        const float v = block_sum(acc[k], sh);
+        if (threadIdx.x == 0) inj[t * HC + k] = v;
+    }
+}
 __global__ void gr_silu_f_kernel(const float* __restrict__ lo, float* __restrict__ out, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -680,6 +703,11 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
 void gr_xn_rows(const float* R, const float* rs, const float* w_norm, float* xn, int64_t T, void* stream) {
     gr_xn_rows_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, xn, T);
     check("gr_xn_rows");
+}
+void gr_xn_inject(const float* R, const float* rs, const float* w_norm, const uint16_t* w_inject, float* xn, float* inj,
+                  int64_t T, void* stream) {
+    gr_xn_inject_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, w_inject, xn, inj);
+    check("gr_xn_inject");
 }
 void gr_silu_f(const float* lo, float* out, int64_t T, void* stream) {
     gr_silu_f_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, out, T * LR);
