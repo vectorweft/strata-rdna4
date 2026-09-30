@@ -413,8 +413,21 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 const int64_t nb = row_bytes / 34;                 // Q8_0 blocks per row
                 std::vector<uint8_t> q8((size_t) used), q4((size_t) (n_dvocab_ * nb * 18));
                 uint8_t* d4 = nullptr;
-                if (cudaMemcpy(q8.data(), dhead_, q8.size(), cudaMemcpyDeviceToHost) == cudaSuccess &&
-                    cudaMalloc((void**) &d4, q4.size()) == cudaSuccess) {
+                // the Q8_0 rows leave the device BEFORE the Q4_0 copy is allocated: holding both at once (Q8 + Q4)
+                // is more than bind_bytes reserved, and with the whole vocabulary the allocation failed and the
+                // drafts silently kept the 644 MiB native rows
+                bool on_host = cudaMemcpy(q8.data(), dhead_, q8.size(), cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (on_host) { cudaFree(dhead_); dhead_ = nullptr; }
+                if (on_host && cudaMalloc((void**) &d4, q4.size()) != cudaSuccess) {
+                    cudaGetLastError();
+                    d4 = nullptr;   // put the Q8_0 rows back
+                    if (cudaMalloc((void**) &dhead_, q8.size()) != cudaSuccess ||
+                        cudaMemcpy(dhead_, q8.data(), q8.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = "mtp: the draft head does not fit";
+                        return false;
+                    }
+                }
+                if (on_host && d4 != nullptr) {
                     auto h2f = [](uint16_t h) {
                         const uint32_t sgn = (uint32_t) (h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
                         uint32_t u;
@@ -455,14 +468,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                             dst[2 + j] = (uint8_t) (a | (c << 4));
                         }
                     }
-                    if (cudaMemcpy(d4, q4.data(), q4.size(), cudaMemcpyHostToDevice) == cudaSuccess) {
-                        cudaFree(dhead_);
-                        dhead_ = d4;
-                        dhead_type_ = 2;
-                        used = (int64_t) q4.size();
-                    } else {
-                        cudaFree(d4);
+                    if (cudaMemcpy(d4, q4.data(), q4.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = "mtp: uploading the Q4_0 draft head failed";
+                        return false;
                     }
+                    dhead_ = d4;
+                    dhead_type_ = 2;
+                    used = (int64_t) q4.size();
                 }
                 cudaGetLastError();
             }
