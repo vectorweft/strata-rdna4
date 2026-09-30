@@ -2769,6 +2769,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
                 return 1;
             }
+            // the adaptive tier exchanges experts between RAM and the GPU cache; without these buffers every swap
+            // was dropped in resident_stage_swaps and --adapt-every did nothing
+            if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
+                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+                std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
+                return 1;
+            }
             pinned_early = true;
             std::fprintf(stderr, "strata generate: steady-state CPU cache misses are pinned in RAM (%zu experts on "
                                  "helper GPUs excluded); borrowed cache entries may use mmap during prompt prefill\n",
@@ -4035,13 +4042,16 @@ int main(int argc, char** argv) {
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
+            const bool ram_only = src.complement_ready();
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 cand.clear();
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+                    // a candidate must be one the CPU computes (held in RAM): an expert a helper GPU holds is not
+                    // in RAM, so swapping it in would read the file and push a RAM-less expert out to mmap
+                    if (r[e] < 0) { if (u[e] >= 2.0f && (!ram_only || src.has_resident(l, e))) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -5557,15 +5567,22 @@ int main(int argc, char** argv) {
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
+            int64_t n_hot = 0, n_cand = 0; float vmax = 0;
+            const bool ram_only = src.complement_ready();
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 cand.clear();
                 vict.clear();
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+                    // a candidate must be one the CPU computes (held in RAM): an expert a helper GPU holds is not
+                    // in RAM, so swapping it in would read the file and push a RAM-less expert out to mmap
+                    if (r[e] < 0 && u[e] >= 2.0f) ++n_hot;
+                    if (r[e] < 0) { if (u[e] >= 2.0f && (!ram_only || src.has_resident(l, e))) cand.emplace_back(u[e], e); }
+                    else if (u[e] > vmax) vmax = u[e];
                     else vict.emplace_back(u[e], e);
                 }
+                n_cand += (int64_t) cand.size();
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
                 const size_t nc = std::min(cand.size(), vict.size());
@@ -5578,6 +5595,9 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            static const bool atrace = std::getenv("STRATA_ADAPT_TRACE") != nullptr;
+            if (atrace) std::fprintf(stderr, "adapt: %lld hot misses, %lld RAM-held candidates, %zu swaps (ram_only %d, max resident usage %.1f)\n",
+                                     (long long) n_hot, (long long) n_cand, swaps.size(), (int) ram_only, vmax);
             if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) {
                 std::fprintf(stderr, "strata generate: an adaptive refill failed (copying evicted experts back)\n");
                 return false;
