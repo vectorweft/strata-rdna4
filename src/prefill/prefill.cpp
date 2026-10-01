@@ -1,4 +1,5 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include "strata/kernels/wmma_gemm.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/mtp.hpp"
@@ -951,9 +952,19 @@ bool hc_mmq_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_HC_MMQ"); return !(v && v[0] == '0'); }();
     return on;
 }
+// The dense Q8_0 projections on RDNA4's FP16 WMMA (kernels/wmma_gemm): ~100 TFLOPS on these shapes against the
+// MMQ path's ~42 TOPS (src/kernels/wmma_gemm_test.cpp).  STRATA_PREFILL_WMMA=0: llama.cpp's MMQ as before.
+bool prefill_wmma_on(int type, int64_t K) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_WMMA"); return !(v && v[0] == '0'); }();
+    return on && type == 8 && strata::kernels::wmma_q8_0_gemm_supported(K);
+}
 template <typename M>
 void mmq_dense(M& m, const void* w_blocks, int type, int64_t rows, int64_t K, const float* Xf, float* Y, int64_t T,
                int64_t ldy) {
+    if (prefill_wmma_on(type, K)) {
+        strata::kernels::wmma_q8_0_gemm(Xf, K, w_blocks, Y, ldy > 0 ? ldy : rows, T, rows, K, m.cs);
+        return;
+    }
     mmq::quantize(Xf, nullptr, m.Xqd, type, K, K, T, m.cs);
     mmq::set_bounds(m.dense_bounds, T, m.cs);
     mmq::Product p;
@@ -966,6 +977,10 @@ void mmq_dense(M& m, const void* w_blocks, int type, int64_t rows, int64_t K, co
 template <typename M>
 bool native_proj_x(M& m, const core::WeightRef* w, const float* Xf, const uint16_t* Xh, float* Y, int64_t T,
                    const std::string& name, std::string& err, int64_t ldy = 0) {
+    if (Xf && w->native_data && dense_mmq_on() && prefill_wmma_on(w->native_type, w->ne0)) {
+        strata::kernels::wmma_q8_0_gemm(Xf, w->ne0, w->native_data, Y, ldy > 0 ? ldy : w->ne1, T, w->ne1, w->ne0, m.cs);
+        return true;
+    }
     if (Xf && w->native_data && dense_mmq_on() && m.Xqd && m.dense_bounds && m.ids_identity && m.mmq_ctx &&
         mmq::supported(w->native_type) && w->ne0 <= 12288) {
         mmq::quantize(Xf, nullptr, m.Xqd, w->native_type, w->ne0, w->ne0, T, m.cs);

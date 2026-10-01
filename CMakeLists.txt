@@ -243,6 +243,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/wmma_gemm.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -445,6 +446,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(qsa_prompt_attn_parity_hip PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(qsa_prompt_attn_parity_hip PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
+  add_executable(wmma_gemm_test src/kernels/wmma_gemm_test.cpp)
+  target_include_directories(wmma_gemm_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(wmma_gemm_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_executable(mmvq_bench src/kernels/mmvq_bench.cpp)
   target_include_directories(mmvq_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(mmvq_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
