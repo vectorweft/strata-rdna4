@@ -115,6 +115,9 @@ void gdn_front(const void* w_qkv, const void* w_z, const void* x_q8_1, float* y_
                const float* ssm_a, float* gate, float* beta, int h_v, int ncols, void* stream);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+// Q8_0 with an explicit block shape (nw warps per row, rows per block), every column count through one kernel
+void native_q8_0_mmvq_cfg(const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, int nw, int rows,
+                          void* stream);
 
 // Tensor parallel (verify window): rows [row0, row0 + n_rows) of an n_out-row Q8_0 matrix, each bitwise as
 // native_mmvq's exact path, written into y and (when non-null) the peer GPU's y_peer, both laid out [ncols][n_out].

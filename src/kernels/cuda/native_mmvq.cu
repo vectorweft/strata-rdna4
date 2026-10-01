@@ -1432,6 +1432,13 @@ void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    // long rows (the 6144-wide ssm_out / attn_output): 8 warps split a row's K, one kernel for every column count -
+    // 30 vs 38-43 us (~550 vs ~430 GB/s) on R9700 (src/kernels/mmvq_bench.cpp); STRATA_MMVQ_LONG8=0: the old path
+    static const bool long8 = [] { const char* v = std::getenv("STRATA_MMVQ_LONG8"); return !(v && v[0] == '0'); }();
+    if (long8 && g_multi_exact && n_in >= 4096) {
+        native_q8_0_mmvq_cfg(weights, x_q8_1, y, n_in, n_out, ncols, 8, 1, stream);
+        return;
+    }
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
@@ -1663,5 +1670,41 @@ void tp_gdn_front(const void* w_qkv, const void* w_z, const void* x_q8_1, float*
     launch_check();
 }
 
-} // namespace strata::kernels
+namespace {
+template <int NC, int NW, int ROWS>
+void cfg_launch(const void* w, const void* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    using F = SmallTraits<Q80Block, 8>;
+    native_mmvq_multi_kernel<F, NC, NW, ROWS><<<unsigned((n_out + ROWS - 1) / ROWS), dim3(WARP, NW), 0, s>>>(
+        static_cast<const Q80Block*>(w), static_cast<const Q81Block*>(x), y, n_in, n_out);
+}
+template <int NW, int ROWS>
+void cfg_cols(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s) {
+    switch (ncols) {
+        case 1: cfg_launch<1, NW, ROWS>(w, x, y, n_in, n_out, s); break;
+        case 2: cfg_launch<2, NW, ROWS>(w, x, y, n_in, n_out, s); break;
+        case 3: cfg_launch<3, NW, ROWS>(w, x, y, n_in, n_out, s); break;
+        case 4: cfg_launch<4, NW, ROWS>(w, x, y, n_in, n_out, s); break;
+        case 5: cfg_launch<5, NW, ROWS>(w, x, y, n_in, n_out, s); break;
+        case 6: cfg_launch<6, NW, ROWS>(w, x, y, n_in, n_out, s); break;
+        case 7: cfg_launch<7, NW, ROWS>(w, x, y, n_in, n_out, s); break;
+        case 8: cfg_launch<8, NW, ROWS>(w, x, y, n_in, n_out, s); break;
+    }
+}
+}  // namespace
 
+// Q8_0 MMVQ with an explicit block shape (benchmarking: nw warps split a row's K, rows rows per block), every column
+// count through the same kernel
+void native_q8_0_mmvq_cfg(const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, int nw, int rows,
+                          void* stream) {
+    validate_shape(n_in, ncols, 32);
+    const auto s = static_cast<cudaStream_t>(stream);
+    if (nw == 4 && rows == 1) cfg_cols<4, 1>(w, x_q8_1, y, n_in, n_out, ncols, s);
+    else if (nw == 8 && rows == 1) cfg_cols<8, 1>(w, x_q8_1, y, n_in, n_out, ncols, s);
+    else if (nw == 16 && rows == 1) cfg_cols<16, 1>(w, x_q8_1, y, n_in, n_out, ncols, s);
+    else if (nw == 4 && rows == 2) cfg_cols<4, 2>(w, x_q8_1, y, n_in, n_out, ncols, s);
+    else if (nw == 8 && rows == 2) cfg_cols<8, 2>(w, x_q8_1, y, n_in, n_out, ncols, s);
+    else throw std::invalid_argument("native_q8_0_mmvq_cfg: unsupported shape");
+    launch_check();
+}
+
+} // namespace strata::kernels
