@@ -156,6 +156,13 @@ private:
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
+    bool build_draft_head(const NativeHead* head, const std::vector<uint8_t>& raw, int32_t*& dvocab, uint8_t*& dhead,
+                          int& dhead_type, int64_t& n_dvocab, const char* what, std::string& err);
+    uint8_t* dhead2_ = nullptr;     // draft_vocab_steps.bin: the chain's later steps' (smaller) head
+    int dhead2_type_ = -1;
+    int32_t* dvocab2_ = nullptr;
+    int64_t n_dvocab2_ = 0;
+    bool step_head_ = false;        // set while capture_step records
     uint8_t* dhead_ = nullptr;
     int dhead_type_ = -1;          // the draft head's GGML type (the native head's, or Q4_0 re-quantized)
     int32_t* dvocab_ = nullptr;

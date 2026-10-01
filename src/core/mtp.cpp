@@ -113,6 +113,8 @@ MtpDrafter::~MtpDrafter() {
     if (cparams_) cudaFree(cparams_);
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
+    if (dhead2_) cudaFree(dhead2_);
+    if (dvocab2_) cudaFree(dvocab2_);
     if (cscratch_) cudaFree(cscratch_);
     if (h_cparams_) cudaFreeHost(h_cparams_);
     if (h_chist_) cudaFreeHost(h_chist_);
@@ -318,6 +320,13 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, int he
                 bytes += (uint64_t) size + (to_q4 ? rows * (head_row_bytes / 34) * 18 +
                                                         std::min<uint64_t>(rows * head_row_bytes, kDraftHeadChunkBytes)
                                                   : rows * head_row_bytes);
+                if (FILE* f2 = std::fopen((rt_dir_ + "/draft_vocab_steps.bin").c_str(), "rb")) {   // the steps' head
+                    std::fseek(f2, 0, SEEK_END);
+                    const long s2 = std::ftell(f2);
+                    std::fclose(f2);
+                    if (s2 >= 4 && s2 % 4 == 0)
+                        bytes += (uint64_t) s2 + (uint64_t) (s2 / 4) * (to_q4 ? (head_row_bytes / 34) * 18 : head_row_bytes);
+                }
             }
         }
     }
@@ -382,6 +391,58 @@ void MtpDrafter::set_draft_history(const int32_t* tail, int64_t n_tail, int32_t 
     coupled_hist_base(tail, n_tail, next, h, h_chist_ + (kCoupledHistCap - h));
 }
 
+bool MtpDrafter::build_draft_head(const NativeHead* head, const std::vector<uint8_t>& raw, int32_t*& dvocab,
+                                  uint8_t*& dhead, int& dhead_type, int64_t& n_dvocab, const char* what,
+                                  std::string& err) {
+    n_dvocab = (int64_t) (raw.size() / 4);
+    const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
+    // A Q8_0 head is re-quantized to Q4_0 for the drafts (STRATA_MTP_HEAD=q8_0 keeps it): every draft step
+    // reads the whole draft head (289 MB at Q8_0 over 106K tokens, most of a step's bytes), while the
+    // verify window, which decides the text, keeps the full-precision head.  On the device, a chunk of rows
+    // at a time: the Q8_0 rows never exist whole (a 248K-token subset is 644 MiB at Q8_0, 341 at Q4_0), and
+    // no pageable host copy (in --serve, with tens of GiB pinned, its staging allocation failed).
+    const char* hv = std::getenv("STRATA_MTP_HEAD");
+    const bool to_q4 = head->type() == 8 && !(hv && std::string(hv) == "q8_0") && row_bytes % 34 == 0;
+    if (cudaMalloc((void**) &dvocab, raw.size()) != cudaSuccess) {
+        err = std::string("mtp: the ") + what + " does not fit";
+        return false;
+    }
+    cudaMemcpy(dvocab, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+    int64_t used = 0;
+    if (to_q4) {
+        const int64_t nb = row_bytes / 34, q4_row = nb * 18;
+        const int64_t chunk = std::min<int64_t>(n_dvocab, std::max<int64_t>(1, kDraftHeadChunkBytes / row_bytes));
+        uint8_t* tmp = nullptr;
+        if (cudaMalloc((void**) &dhead, (size_t) (n_dvocab * q4_row)) != cudaSuccess ||
+            cudaMalloc((void**) &tmp, (size_t) (chunk * row_bytes)) != cudaSuccess) {
+            err = std::string("mtp: the ") + what + " does not fit";
+            return false;
+        }
+        for (int64_t r0 = 0; r0 < n_dvocab; r0 += chunk) {
+            const int64_t nr = std::min<int64_t>(chunk, n_dvocab - r0);
+            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab + r0, nr, tmp, nullptr);
+            strata::kernels::q8_0_to_q4_0(tmp, dhead + (size_t) (r0 * q4_row), nr * nb, nullptr);
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) { err = "mtp: re-quantizing the draft head failed"; return false; }
+        cudaFree(tmp);
+        dhead_type = 2;
+        used = n_dvocab * q4_row;
+    } else {
+        if (cudaMalloc((void**) &dhead, (size_t) (n_dvocab * row_bytes)) != cudaSuccess) {
+            err = std::string("mtp: the ") + what + " does not fit";
+            return false;
+        }
+        strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab, n_dvocab, dhead, nullptr);
+        cudaDeviceSynchronize();
+        dhead_type = head->type();
+        used = n_dvocab * row_bytes;
+    }
+    vram_ += (uint64_t) used + raw.size();
+    std::fprintf(stderr, "strata mtp: %s over %lld tokens (%.1f MiB, %s)\n", what, (long long) n_dvocab,
+                 (double) used / 1048576.0, dhead_type == 2 ? "Q4_0 for the drafts" : "the native head's rows");
+    return true;
+}
+
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err) {
     const OnDevice on_device(device_);
     wt_ = &wt;
@@ -396,57 +457,20 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         err = "mtp: the draft logits do not fit";
         return false;
     }
-    // the draft head's token subset, when tools/draft_vocab.py wrote one
+    // the draft head's token subset, when tools/draft_vocab.py wrote one; and a second, smaller one for the chain's
+    // later steps (draft_vocab_steps.bin): their drafts are accepted less often, so a head over the common tokens
+    // only is the cheaper trade there (the first step keeps the full subset)
     if (dhead_ == nullptr) {
         std::vector<uint8_t> raw;
-        if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
-            n_dvocab_ = (int64_t) (raw.size() / 4);
-            const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            // A Q8_0 head is re-quantized to Q4_0 for the drafts (STRATA_MTP_HEAD=q8_0 keeps it): every draft step
-            // reads the whole draft head (289 MB at Q8_0 over 106K tokens, most of a step's bytes), while the
-            // verify window, which decides the text, keeps the full-precision head.  On the device, a chunk of rows
-            // at a time: the Q8_0 rows never exist whole (a 248K-token subset is 644 MiB at Q8_0, 341 at Q4_0), and
-            // no pageable host copy (in --serve, with tens of GiB pinned, its staging allocation failed).
-            const char* hv = std::getenv("STRATA_MTP_HEAD");
-            const bool to_q4 = head->type() == 8 && !(hv && std::string(hv) == "q8_0") && row_bytes % 34 == 0;
-            if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess) {
-                err = "mtp: the draft head does not fit";
-                return false;
-            }
-            cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
-            int64_t used = 0;
-            if (to_q4) {
-                const int64_t nb = row_bytes / 34, q4_row = nb * 18;
-                const int64_t chunk = std::min<int64_t>(n_dvocab_, std::max<int64_t>(1, kDraftHeadChunkBytes / row_bytes));
-                uint8_t* tmp = nullptr;
-                if (cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * q4_row)) != cudaSuccess ||
-                    cudaMalloc((void**) &tmp, (size_t) (chunk * row_bytes)) != cudaSuccess) {
-                    err = "mtp: the draft head does not fit";
-                    return false;
-                }
-                for (int64_t r0 = 0; r0 < n_dvocab_; r0 += chunk) {
-                    const int64_t nr = std::min<int64_t>(chunk, n_dvocab_ - r0);
-                    strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_ + r0, nr, tmp, nullptr);
-                    strata::kernels::q8_0_to_q4_0(tmp, (uint8_t*) dhead_ + (size_t) (r0 * q4_row), nr * nb, nullptr);
-                }
-                if (cudaDeviceSynchronize() != cudaSuccess) { err = "mtp: re-quantizing the draft head failed"; return false; }
-                cudaFree(tmp);
-                dhead_type_ = 2;
-                used = n_dvocab_ * q4_row;
-            } else {
-                if (cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
-                    err = "mtp: the draft head does not fit";
-                    return false;
-                }
-                strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
-                cudaDeviceSynchronize();
-                dhead_type_ = head->type();
-                used = n_dvocab_ * row_bytes;
-            }
-            vram_ += (uint64_t) used + raw.size();
-            std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB, %s)\n", (long long) n_dvocab_,
-                         (double) used / 1048576.0, dhead_type_ == 2 ? "Q4_0 for the drafts" : "the native head's rows");
-        }
+        if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0 &&
+            !build_draft_head(head, raw, dvocab_, dhead_, dhead_type_, n_dvocab_, "draft head", err))
+            return false;
+    }
+    if (dhead2_ == nullptr && dhead_ != nullptr) {
+        std::vector<uint8_t> raw;
+        if (read_file(rt_dir_ + "/draft_vocab_steps.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0 &&
+            !build_draft_head(head, raw, dvocab2_, dhead2_, dhead2_type_, n_dvocab2_, "later steps' draft head", err))
+            return false;
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     return true;
@@ -598,10 +622,13 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                     bf16("hyper_connection_mixer.input_mix_weight_up.weight"), nullptr, EPS, gs, ss.block.gr,
                     sample_ + t * N, dummy_inj_, cs);
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
+        // the chain's later steps take the smaller head when there is one (not the coupled sampling: its id
+        // maps are the first subset's)
+        const bool small = step_head_ && dhead2_ != nullptr && !coupled_rec_;
         const bool sub = dhead_ != nullptr;
-        const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv,
-                    T, cs);
+        const int64_t nv = small ? n_dvocab2_ : sub ? n_dvocab_ : n_vocab_;
+        native_mmvq(small ? dhead2_type_ : sub ? dhead_type_ : head_->type(),
+                    small ? dhead2_ : sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
@@ -614,7 +641,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         sp.temperature = 0.0f;
         sample_tokens(head_logits_, T, (int) nv, nullptr, 0, sp, out_ids_, cs);
         row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
-        if (sub) map_ids(out_ids_, dvocab_, T, cs);
+        if (small) map_ids(out_ids_, dvocab2_, T, cs);
+        else if (sub) map_ids(out_ids_, dvocab_, T, cs);
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
         return false;
@@ -706,7 +734,9 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
     coupled_rec_ = coupled;
     coupled_j_ = j;
+    step_head_ = true;   // (the smaller head, when draft_vocab_steps.bin built one)
     bool ok = record_forward(1, row, cs_, err);
+    step_head_ = false;
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
