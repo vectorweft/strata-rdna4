@@ -1,0 +1,34 @@
+[
+ {
+  "engine": "upstream1",
+  "rep": 2,
+  "len": "1k",
+  "prompt_tokens": 999,
+  "reused": 0,
+  "prefill_tok_s": 248.2,
+  "prompt_s": 4.02,
+  "decoded": 256,
+  "decode_tok_s": 58.03,
+  "ms_per_round": 42.01,
+  "spec_accept": 0.654,
+  "ttft_s": 4.06,
+  "wall_s": 8.4,
+  "done_line": "DONE 256 999 4024.2 4411.5 length 151 231 0 151428 157693 10240 0 0.0 999 3587"
+ },
+ {
+  "engine": "upstream1",
+  "rep": 2,
+  "len": "4k",
+  "prompt_tokens": 4000,
+  "reused": 0,
+  "prefill_tok_s": 75.1,
+  "prompt_s": 53.26,
+  "decoded": 256,
+  "decode_tok_s": 55.8,
+  "ms_per_round": 56.64,
+  "spec_accept": 0.829,
+  "ttft_s": 53.29,
+  "wall_s": 57.9,
+  "done_line": "DONE 256 4000 53261.8 4588.1 length 175 211 0 111011 126967 25450 0 0.0 4000 13193"
+ }
+]
