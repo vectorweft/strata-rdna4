@@ -1,3 +1,18 @@
+> **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) (MIT) for AMD RDNA4 cards.** It runs
+> Unsloth's Qwen3.8-Flash-Next `UD-Q4_K_XL` on one or two Radeon RDNA4 GPUs (measured on 2x Radeon AI PRO R9700). On the
+> same PC as upstream Strata 0.1.40.1 it reads prompts 2.1-2.8x faster on one card and 2.9-3.6x on two, and writes
+> 1.06-1.21x / 1.53-1.92x faster:
+>
+> | 2x R9700, 96 GB RAM, median of 3 | Prompt 32K (tokens/s) | Prompt 128K | Output at 32K (tokens/s) | Output at 128K |
+> | --- | ---: | ---: | ---: | ---: |
+> | Upstream 0.1.40.1 (one GPU: its two-GPU mode needs ~135 GB of RAM) | 515 | 493 | 51.5 | 51.1 |
+> | This fork, one GPU | 1,422 | 1,162 | 61.8 | 54.4 |
+> | This fork, two GPUs | 1,826 | 1,415 | 84.7 | 77.9 |
+>
+> Setup, build and configuration for this fork: **[docs/RDNA4.md](docs/RDNA4.md)**. Every run and the method:
+> [bench/results/2026-10-06-fork-vs-upstream](bench/results/2026-10-06-fork-vs-upstream/README.md). The rest of this
+> page is upstream's README; its install path (`setup`) and its NVIDIA numbers are upstream's.
+
 <h1 align="center">Strata</h1>
 
 <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>

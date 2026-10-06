@@ -1117,7 +1117,7 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
             run(build)
 
 
-ENGINE_SOURCES = ("CMakeLists.txt", "src", "include", "third_party/ggml")
+ENGINE_SOURCES = ("CMakeLists.txt", "src", "include", "third_party/ggml", "third_party/ggml-mmq")
 VISION_SOURCES = ("tools/vision",)
 
 
