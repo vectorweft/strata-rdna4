@@ -275,7 +275,7 @@ struct Prefill::Impl {
         cudaStream_t cs = nullptr;
         cudaEvent_t ready = nullptr, done = nullptr;   // ready: on this GPU's stream; done: on the helper's
         std::unique_ptr<mmq::Context> ctx;
-        int64_t rows_cap = 0, bounds_cap = 0;
+        int64_t T_cap = 0, rows_cap = 0, bounds_cap = 0;   // T_cap: the largest chunk its buffers hold
         float *mixed = nullptr, *GU = nullptr, *H = nullptr;
         void *Xq = nullptr, *Hq = nullptr;
         uint8_t *grp_gu = nullptr, *grp_d = nullptr;
@@ -1069,7 +1069,11 @@ bool helper_setup(M& m) {
     h.dev = m.helpers[0].first;
     h.cache = m.helpers[0].second;
     const int64_t N = m.g->n_embd, K = (int64_t) m.ss->k, E = m.g->n_expert;
-    h.rows_cap = m.T * K;
+    // sized for the largest chunk, not this run's: a request relayouts the chunk to what its prompt needs, so the
+    // first run can be short (a 7.9K-token system prompt read up to its checkpoint: 7936) and a later one 8192 - the
+    // activations' peer copy then overran `mixed` ("prefill mmq: quantize: invalid argument", a GPU memory fault)
+    h.T_cap = std::max(m.T, m.T_max);
+    h.rows_cap = h.T_cap * K;
     h.bounds_cap = E + 1 + (E / MMQ_GROUP + 2) * (MMQ_GROUP + 1);
     const core::OnDevice od(h.dev);
     bool ok = cudaStreamCreateWithFlags(&h.cs, cudaStreamNonBlocking) == cudaSuccess &&
@@ -1079,7 +1083,7 @@ bool helper_setup(M& m) {
         if (cudaMalloc(p, bytes) != cudaSuccess) { ok = false; *p = nullptr; return; }
         h.dev_owned.push_back(*p);
     };
-    dm((void**) &h.mixed, (size_t) m.T * N * 4);
+    dm((void**) &h.mixed, (size_t) h.T_cap * N * 4);
     dm(&h.Xq, mmq::q8_bytes(h.rows_cap, N));
     dm((void**) &h.GU, (size_t) h.rows_cap * 1280 * 4);
     dm((void**) &h.H, (size_t) h.rows_cap * 640 * 4);
@@ -1107,7 +1111,7 @@ bool helper_setup(M& m) {
         h.dev_owned.clear();
         std::fprintf(stderr, "strata prefill: the helper GPU %d has no room for its MoE buffers (%.0f MiB); its experts "
                              "are copied to this GPU instead\n", h.dev,
-                     ((double) m.T * N * 4 + 2 * mmq::q8_bytes(h.rows_cap, N) + (double) h.rows_cap * 1920 * 4) / 1048576.0);
+                     ((double) h.T_cap * N * 4 + 2 * mmq::q8_bytes(h.rows_cap, N) + (double) h.rows_cap * 1920 * 4) / 1048576.0);
         return false;
     }
     h.on = true;
@@ -1267,7 +1271,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
-        const bool hp_on = stream_all && helper_setup(m);
+        const bool hp_on = stream_all && helper_setup(m) && m.T <= m.hp.T_cap;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; const uint8_t* peer = nullptr; int peer_dev = -1; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;

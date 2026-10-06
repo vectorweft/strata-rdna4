@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -643,6 +643,10 @@ class Service:
         self.before_load = None
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # an end-of-turn inside the thinking (no </think> yet) would end the request with no answer and no tool call -
+        # agents then stop in the middle of a task.  The thinking is closed instead and the answer generated after it
+        # (config "close_thinking_on_eos": false keeps the plain stop)
+        self.close_thinking_on_eos = True
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -1004,25 +1008,56 @@ class Service:
                     self.rate.clear()               # the previous request's samples must not leak into this one
                 before = getattr(self.engine, "last", None)
                 last_print = time.time()
-                gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
-                    self.engine.generate(ids, max_new, sampling, cancel)
+                def generate(prompt, budget):
+                    return self.engine.generate(prompt, budget, sampling, cancel, embeddings=emb) if emb else \
+                        self.engine.generate(prompt, budget, sampling, cancel)
+                gen = generate(ids, max_new)
+                closed_thinking, last_text = False, ""
                 try:
-                    for t in gen:
-                        if t is None:                   # heartbeat while the engine is quiet
-                            last_print = self._progress(last_print)
-                            yield "ping", None
-                            continue
-                        n += 1
-                        if t in self.stop_ids:
-                            finish = "stop"
+                    while True:
+                        reopen = False
+                        for t in gen:
+                            if t is None:               # heartbeat while the engine is quiet
+                                last_print = self._progress(last_print)
+                                yield "ping", None
+                                continue
+                            n += 1
+                            if t in self.stop_ids:
+                                if (self.close_thinking_on_eos and thinking and parser.state == "reasoning" and
+                                        not closed_thinking and not cancel.is_set()):
+                                    n -= 1              # replaced by the end of the thinking, not part of the reply
+                                    reopen = True
+                                    break
+                                finish = "stop"
+                                raw_ids.append(t)
+                                break
                             raw_ids.append(t)
+                            text = detok.push(t)
+                            last_text = text or last_text
+                            evs = parser.feed(text)
+                            self._note(n, evs)
+                            last_print = self._progress(last_print)
+                            for ev in evs:
+                                yield "event", ev
+                        if not reopen:
                             break
-                        raw_ids.append(t)
-                        evs = parser.feed(detok.push(t))
+                        # the model ended its turn inside the thinking: close the thinking and let it answer.  The
+                        # engine still holds this reply, so the continuation reads only the few closing tokens.
+                        closed_thinking = True
+                        gen.close()                     # this part's DONE before the continuation's GEN
+                        close = ("" if last_text.endswith("\n") else "\n") + THINK_END + "\n\n"
+                        close_ids = self.tok.encode(close, parse_special=True)
+                        if n + len(close_ids) >= max_new:
+                            break                       # finish stays "length": no room left for an answer
+                        print(f"[strata] the model ended its turn inside the thinking after {n} tokens: closed the "
+                              "thinking, generating the answer", flush=True)
+                        raw_ids += close_ids
+                        n += len(close_ids)
+                        evs = parser.feed(close)
                         self._note(n, evs)
-                        last_print = self._progress(last_print)
                         for ev in evs:
                             yield "event", ev
+                        gen = generate(list(ids) + raw_ids, max_new - n)
                     if cancel.is_set():
                         finish = "cancel"
                 except EngineDied as e:
@@ -1845,6 +1880,44 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+GGUF_SAMPLING = {"temp": "temperature", "top_k": "top_k", "top_p": "top_p", "min_p": "min_p",
+                 "penalty_last_n": "penalty_last_n", "penalty_repeat": "repetition_penalty"}
+
+
+def sampling_defaults_from_model(cfg: dict) -> dict:
+    """A config without a `sampling` block: the model file's recommended sampling (`general.sampling.*` of the GGUF
+    given with --native), as llama.cpp's server uses it.  Without it every client that sends no temperature (agents
+    built on the OpenAI SDK usually don't) decoded greedily, which the model's authors advise against for a thinking
+    model (repetition, a turn that ends in the middle of the thinking).  {} when the file has none."""
+    args = [str(x) for x in cfg.get("args") or []]
+    path = args[args.index("--native") + 1] if "--native" in args[:-1] else None
+    if not path or not Path(path).is_file():
+        return {}
+    try:
+        from gguf_reader import GGUFFile
+        meta = GGUFFile(Path(path)).metadata
+    except (OSError, ValueError, KeyError) as e:
+        print(f"[strata] could not read the sampling defaults of {path}: {e}", flush=True)
+        return {}
+    found = {}
+    for key, name in GGUF_SAMPLING.items():
+        v = meta.get("general.sampling." + key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            found[name] = round(float(v), 6) if name in ("temperature", "top_p", "min_p", "repetition_penalty") \
+                else int(v)
+    if "top_k" in found:
+        found["top_k"] = max(1, min(64, found["top_k"]))   # the sampled path keeps the 64 best
+    if found.get("repetition_penalty") == 1.0:
+        found.pop("repetition_penalty")
+    if found.get("penalty_last_n", 1) <= 0 or "repetition_penalty" not in found:
+        found.pop("penalty_last_n", None)
+    try:
+        return sampling_defaults_from_config({"sampling": found})
+    except SystemExit as e:                              # a value the engine can't take: stay with greedy
+        print(f"{e} (from the model file; ignored)", flush=True)
+        return {}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -1911,9 +1984,12 @@ def main() -> int:
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
+        source = "the config"
+        if "sampling" not in cfg:                       # no block at all ("sampling": {} keeps greedy)
+            sampling_defaults, source = sampling_defaults_from_model(cfg), "the model file"
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[strata] sampling defaults from {source}: {pretty}", flush=True)
         if cfg.get("vision"):
             print("loading the vision encoder ...", flush=True)
             vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
@@ -1943,6 +2019,7 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
+    svc.close_thinking_on_eos = cfg.get("close_thinking_on_eos") is not False
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.config:                                        # the Chat settings shared with other apps, from last time

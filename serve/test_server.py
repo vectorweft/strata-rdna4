@@ -1070,5 +1070,62 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
         self.assertEqual(self.req("/health")[1]["loaded"], True)
 
+class ThinkingEndOfTurn(unittest.TestCase):
+    """An end-of-turn inside the thinking does not end the request: the thinking is closed and the answer follows."""
+
+    def run_service(self, scripts, close=True, thinking=True, max_new=200):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, scripts, max_context=CTX)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.close_thinking_on_eos = close
+        ids = tok.encode("prompt")
+        out = list(svc.run(ids, thinking, None, max_new, {}, threading.Event()))
+        text = {"reasoning": "", "content": ""}
+        for kind, x in out:
+            if kind == "event" and x.kind in text:
+                text[x.kind] += x.text
+        return engine, ids, text, out[-1][1]
+
+    def test_closed_and_answered(self):
+        engine, ids, text, done = self.run_service(["I will now write the file:", "The answer."])
+        self.assertEqual(text["reasoning"], "I will now write the file:\n")
+        self.assertEqual(text["content"], "The answer.")
+        self.assertEqual(done["finish"], "stop")
+        # the continuation is the prompt, the reply so far and the closing of the thinking
+        tok = ByteTokenizer()
+        self.assertEqual(engine.last_prompt, ids + tok.encode("I will now write the file:\n</think>\n\n"))
+        self.assertEqual(engine.turns, 2)
+
+    def test_only_once(self):
+        # the answer's own end-of-turn ends it; a second early end is not reopened (no loop)
+        engine, _, text, done = self.run_service(["thinking", ""])
+        self.assertEqual(text["content"], "")
+        self.assertEqual(done["finish"], "stop")
+        self.assertEqual(engine.turns, 2)
+
+    def test_after_think_end_is_a_plain_stop(self):
+        engine, _, text, done = self.run_service(["done thinking</think>\n\nAnswer.", "never"])
+        self.assertEqual(text["content"], "Answer.")
+        self.assertEqual(engine.turns, 1)
+
+    def test_switched_off(self):
+        engine, _, text, done = self.run_service(["I will now", "never"], close=False)
+        self.assertEqual(text["reasoning"], "I will now")
+        self.assertEqual(text["content"], "")
+        self.assertEqual(engine.turns, 1)
+
+    def test_no_thinking(self):
+        engine, _, text, done = self.run_service(["Plain answer.", "never"], thinking=False)
+        self.assertEqual(text["content"], "Plain answer.")
+        self.assertEqual(engine.turns, 1)
+
+    def test_budget(self):
+        # the closing tokens count against max tokens; no room left -> "length", no second generate
+        engine, _, text, done = self.run_service(["abc", "never"], max_new=12)
+        self.assertEqual(done["finish"], "length")
+        self.assertLessEqual(done["completion_tokens"], 12)
+        self.assertEqual(engine.turns, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

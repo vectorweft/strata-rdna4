@@ -64,6 +64,9 @@
 #else
 #include <unistd.h>
 #include <cerrno>
+#include <csignal>
+#include <execinfo.h>
+#include <pthread.h>
 #endif
 
 #include <cuda_runtime.h>
@@ -762,12 +765,40 @@ MemSample mem_sample() {
     return m;
 }
 
+// --serve's last request step (the `tr` points), kept whether or not STRATA_TRACE prints them: a stall report names
+// the step the request stopped in, which the progress stage alone does not (it is set once per prompt part)
+std::atomic<const char*> g_serve_step{"(none yet)"};
+std::atomic<long long> g_serve_step_a{-1}, g_serve_step_b{-1};
+#if !defined(_WIN32)
+pthread_t g_serve_thread;
+std::atomic<bool> g_serve_thread_set{false};
+// the request thread's stack, printed by that thread itself (SIGUSR2 from the watchdog): `addr2line -e strata` or
+// gdb resolves the offsets of this build
+void serve_stack_handler(int) {
+    void* frames[64];
+    const int n = backtrace(frames, 64);
+    static const char head[] = "  request thread stack (resolve with: addr2line -Cfpe <strata> <offset>):\n";
+    (void) !write(2, head, sizeof head - 1);
+    backtrace_symbols_fd(frames, n, 2);
+}
+#endif
+
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s %lld\" for %lld s; %llu layers served since the "
                     "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, p.where.load(),
                  (long long) p.detail.load(), (long long) ((strata::core::progress_now_ms() - p.since_ms.load()) / 1000),
                  (unsigned long long) layers_during);
+    std::fprintf(f, "  last request step: %s %lld %lld\n", g_serve_step.load(), g_serve_step_a.load(),
+                 g_serve_step_b.load());
+#if !defined(_WIN32)
+    if (g_serve_thread_set.load()) {
+        std::fflush(f);
+        std::signal(SIGUSR2, serve_stack_handler);
+        pthread_kill(g_serve_thread, SIGUSR2);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+#endif
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -4337,6 +4368,9 @@ int main(int argc, char** argv) {
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
+            g_serve_step_a.store(a);
+            g_serve_step_b.store(b);
+            g_serve_step.store(what);   // string literals only: the report reads it later
             if (!trace) return;
             std::fprintf(stderr, "strata trace: %s %lld %lld\n", what, a, b);
             std::fflush(stderr);
@@ -4399,6 +4433,10 @@ int main(int argc, char** argv) {
         // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every
         // part was doing (stall_report), so one occurrence says where the wait is.
         {
+#if !defined(_WIN32)
+            g_serve_thread = pthread_self();   // the thread that runs the requests (stall_report prints its stack)
+            g_serve_thread_set.store(true);
+#endif
             const char* ws = std::getenv("STRATA_WATCHDOG_S");
             const int limit = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
             if (limit > 0)
@@ -4661,6 +4699,7 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
+                tr("restoring a parked conversation");
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g, mtp.kv_state(), err) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
@@ -4891,6 +4930,7 @@ int main(int argc, char** argv) {
                 if (any) res_upload();
                 return true;
             };
+            tr("waiting for the adaptive tier's copies", (long long) pending.size());
             apply_pending(true);
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
@@ -4953,6 +4993,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 const auto tsp = Clock::now();
+                tr(win ? "reading a prompt part (windows)" : "reading a prompt part (batched)", at, to);
                 const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
                 if (!win) tp_dirty = true;
                 if (trace) {
@@ -4978,6 +5019,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                if (to == turn_at || to == root_at) tr("saving a conversation checkpoint", to);
                 if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
