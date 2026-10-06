@@ -84,7 +84,8 @@ One upstream attempt failed and was run again (it is not in the medians; its par
 `upstream-0.1.40.1-1gpu-failed-attempt.json`). In its third repetition, the 4K prompt read at 75 tokens/s (453-456 in
 the other runs), then the 32K prompt stopped with `ERR verify: timed out at layer 4; its GPU waits were released but the
 GPU did not finish within 5 s (#267)` and the engine exited. The rerun of that repetition finished normally. The fork had
-no failed run.
+no failed run; its first 1-GPU start found no VRAM because the failed upstream engine was still holding GPU0 (the
+runner now ends the engine when it stops), and it ran normally once that process was gone.
 
 ## Files
 
