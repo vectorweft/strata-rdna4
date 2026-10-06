@@ -1,6 +1,6 @@
-# Qwen3.8-Flash-Next UD-Q4_K_XL on AMD RDNA4 (this fork)
+# Qwen3.8-Flash-Next UD-Q4_K_XL on AMD RDNA4 (strata-rdna4)
 
-This fork runs Unsloth's 4-bit Qwen3.8-Flash-Next (`UD-Q4_K_XL`) on AMD Radeon RDNA4 cards (gfx1201: Radeon AI PRO
+strata-rdna4, built on [Strata](https://github.com/Niko1221/Strata), runs Unsloth's 4-bit Qwen3.8-Flash-Next (`UD-Q4_K_XL`) on AMD Radeon RDNA4 cards (gfx1201: Radeon AI PRO
 R9700, RX 9070 / 9070 XT; gfx1200: RX 9060 XT), on one card or two. Against upstream Strata 0.1.40.1 on the same PC
 it reads prompts 2.1-2.8x faster on one card and 2.9-3.6x on two, and writes 1.06-1.21x / 1.53-1.92x faster
 ([measurements](../bench/results/2026-10-06-fork-vs-upstream/README.md)).

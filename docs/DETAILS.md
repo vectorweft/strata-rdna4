@@ -1,7 +1,7 @@
 # Strata - the details
 
 The technical side of Strata: every measured number, the API, images, all settings and how the engine works.
-New here? Start with the [README](../README.md) - it has everything you need to install and use it.
+New here? Start with upstream Strata's [README](https://github.com/Niko1221/Strata#readme) - it has everything you need to install and use it. (For this repository's RDNA4 configuration: [RDNA4.md](RDNA4.md).)
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
 > [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) ·
