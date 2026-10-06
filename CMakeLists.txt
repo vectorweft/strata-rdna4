@@ -741,6 +741,31 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  # The pointer-table mmq.cuh (third_party/ggml-mmq/README.md): copied into the build tree with every ggml-cuda file
+  # that includes mmq.cuh by a relative path, so all of strata_mmq's translation units see one mmq_args and the
+  # llama.cpp checkout is never modified.  -> the staging directory (include it first) and the sources to compile.
+  function(strata_stage_mmq ggml_cuda_dir types out_dir out_sources)
+    set(_dst "${CMAKE_BINARY_DIR}/strata_mmq_src")
+    file(SHA256 "${ggml_cuda_dir}/mmq.cuh" _h)
+    if(NOT _h STREQUAL "50db23f5055af6e28c142fcb4c7fb16c51f7137184ebf8c0ca113ed88906851b" AND
+       NOT _h STREQUAL "358038838e59692b986976e3eb46d6168a9c96453f9e7909085ad2334f804f72")
+      message(WARNING "${ggml_cuda_dir}/mmq.cuh is not llama.cpp 3cf0325's: the prompt path's MMQ uses Strata's copy "
+                      "of that revision (third_party/ggml-mmq), which may not match this checkout's other ggml-cuda files")
+    endif()
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml-mmq/mmq.cuh" "${_dst}/mmq.cuh" COPYONLY)
+    foreach(_f mmq-load-tiles.cuh mmq-vec-dot.cuh quantize.cuh quantize.cu)
+      configure_file("${ggml_cuda_dir}/${_f}" "${_dst}/${_f}" COPYONLY)
+    endforeach()
+    set(_srcs "${_dst}/quantize.cu")
+    foreach(_t ${types})
+      set(_i "template-instances/mmq-instance-${_t}.cu")
+      configure_file("${ggml_cuda_dir}/${_i}" "${_dst}/${_i}" COPYONLY)
+      list(APPEND _srcs "${_dst}/${_i}")
+    endforeach()
+    set(${out_dir} "${_dst}" PARENT_SCOPE)
+    set(${out_sources} "${_srcs}" PARENT_SCOPE)
+  endfunction()
+  set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q4_k q5_k q5_1)   # q8_0: the drafter's matrices (E-9)
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
     # from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with
@@ -751,11 +776,9 @@ if(STRATA_NATIVE_EXPERTS)
       set(_strata_gg ${strata_llamacpp_SOURCE_DIR}/ggml)
     endif()
     set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q4_k q5_k q5_1)   # q8_0: the drafter's matrices (E-9)
-      target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
-    endforeach()
-    target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
+    strata_stage_mmq("${_strata_mmq}" "${_strata_mmq_types}" _strata_mmq_staged _strata_mmq_staged_sources)
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq_staged_sources})
+    target_include_directories(strata_mmq PRIVATE ${_strata_mmq_staged} ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
                                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
     if(MSVC)
@@ -776,17 +799,15 @@ if(STRATA_NATIVE_EXPERTS)
     if(NOT EXISTS "${_strata_mmq}/common.cuh" OR NOT EXISTS "${_strata_mmq}/quantize.cu")
       message(FATAL_ERROR "The selected GGML source is missing the ggml-cuda MMQ sources: ${_strata_mmq}")
     endif()
+    strata_stage_mmq("${_strata_mmq}" "${_strata_mmq_types}" _strata_mmq_staged _strata_mmq_staged_sources)
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
       src/prefill/ggml_cuda_host.cu
-      "${_strata_mmq}/quantize.cu")
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q4_k q5_k q5_1)
-      list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
-    endforeach()
+      ${_strata_mmq_staged_sources})
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
-      PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
+      PRIVATE "${_strata_mmq_staged}" "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
